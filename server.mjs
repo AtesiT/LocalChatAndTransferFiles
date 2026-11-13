@@ -4,6 +4,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { networkInterfaces } from "node:os";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
+import { AttachmentStore, downloadDisposition } from "./attachments.mjs";
 
 const MAX_MESSAGES = 100;
 const MAX_LENGTH = 2000;
@@ -14,7 +15,8 @@ const files = new Map([
   ["/styles.css", ["styles.css", "text/css; charset=utf-8"]],
 ]);
 
-export function createChatServer() {
+export function createChatServer(fileLimits = {}) {
+  const attachments = new AttachmentStore(fileLimits);
   const sessions = new Map();
   const clients = new Set();
   const messages = [];
@@ -31,6 +33,7 @@ export function createChatServer() {
     for (const client of clients) send(client.response, event, data);
   };
   const json = (response, status, data) => {
+    if (status >= 400 && !response.req.complete) response.req.resume();
     response.writeHead(status, {
       "Content-Type": "application/json; charset=utf-8",
     });
@@ -79,6 +82,29 @@ export function createChatServer() {
               error: "Cross-origin requests are not allowed.",
             });
         }
+        if (url.pathname === "/api/files") {
+          const token = request.headers.authorization?.replace(/^Bearer /, "");
+          const session = sessions.get(token);
+          if (!session || Date.now() - session.touched > SESSION_TTL)
+            return json(response, 401, {
+              error: "Please join the chat again.",
+            });
+          if (request.headers["content-type"] !== "application/octet-stream")
+            return json(response, 415, {
+              error: "Use application/octet-stream for files.",
+            });
+          session.uploads = (session.uploads || []).filter(
+            (time) => Date.now() - time < 60000,
+          );
+          if (session.uploads.length >= 6)
+            return json(response, 429, {
+              error: "Too many uploads. Try again in a minute.",
+            });
+          session.uploads.push(Date.now());
+          session.touched = Date.now();
+          const attachment = await attachments.upload(request, session.id);
+          return json(response, 201, { attachment });
+        }
         if (!request.headers["content-type"]?.startsWith("application/json"))
           return json(response, 415, { error: "Use application/json." });
         if (url.pathname === "/api/session") {
@@ -121,9 +147,22 @@ export function createChatServer() {
             });
           const input = await body(request);
           const text = typeof input?.text === "string" ? input.text.trim() : "";
-          if (!text || [...text].length > MAX_LENGTH)
+          const attachmentId = input?.attachmentId;
+          if (attachmentId !== undefined && typeof attachmentId !== "string")
+            return json(response, 400, { error: "Invalid attachment." });
+          attachments.prune();
+          const file = attachmentId ? attachments.get(attachmentId) : null;
+          if (
+            attachmentId &&
+            (!file || file.attached || file.ownerId !== session.id)
+          )
             return json(response, 400, {
-              error: "Messages must contain 1–2,000 characters.",
+              error: "Attachment is unavailable. Please upload it again.",
+            });
+          if ((!text && !file) || [...text].length > MAX_LENGTH)
+            return json(response, 400, {
+              error:
+                "Write a message or attach a file. Text is limited to 2,000 characters.",
             });
           session.sent = session.sent.filter(
             (time) => Date.now() - time < 10000,
@@ -141,11 +180,41 @@ export function createChatServer() {
             text,
             time: new Date().toISOString(),
           };
+          if (file) {
+            file.attached = true;
+            message.attachment = attachments.metadata(file);
+          }
           messages.push(message);
-          if (messages.length > MAX_MESSAGES) messages.shift();
+          if (messages.length > MAX_MESSAGES) {
+            const removed = messages.shift();
+            if (removed.attachment) attachments.remove(removed.attachment.id);
+          }
           broadcast("message", message);
           return json(response, 201, { message });
         }
+      }
+      if (
+        (request.method === "GET" || request.method === "HEAD") &&
+        url.pathname.startsWith("/api/files/")
+      ) {
+        const token =
+          request.headers.authorization?.replace(/^Bearer /, "") ||
+          url.searchParams.get("token");
+        const session = sessions.get(token);
+        if (!session || Date.now() - session.touched > SESSION_TTL)
+          return json(response, 401, { error: "Please join the chat again." });
+        const file = attachments.get(url.pathname.slice("/api/files/".length));
+        // Pending uploads stay private, even to other logged-in participants.
+        if (!file?.attached)
+          return json(response, 404, { error: "File is no longer available." });
+        session.touched = Date.now();
+        response.writeHead(200, {
+          "Content-Type": "application/octet-stream",
+          "Content-Length": file.data.length,
+          "Content-Disposition": downloadDisposition(file.name),
+          "Content-Security-Policy": "default-src 'none'; sandbox",
+        });
+        return response.end(request.method === "HEAD" ? undefined : file.data);
       }
       if (request.method === "GET" && url.pathname === "/api/session") {
         const token = request.headers.authorization?.replace(/^Bearer /, "");
@@ -174,6 +243,7 @@ export function createChatServer() {
           user: { id: session.id, name: session.name },
           messages,
           users: online(),
+          fileLimits: attachments.limits,
         });
         broadcast("presence", online());
         response.on("close", () => {
@@ -188,6 +258,7 @@ export function createChatServer() {
         return json(response, 200, {
           name: "localchat",
           maxMessageLength: MAX_LENGTH,
+          fileLimits: attachments.limits,
         });
       }
       if (
@@ -212,6 +283,7 @@ export function createChatServer() {
     }
   });
   const heartbeat = setInterval(() => {
+    attachments.prune();
     for (const { response, session } of clients) {
       session.touched = Date.now();
       response.write(": heartbeat\n\n");
@@ -223,7 +295,10 @@ export function createChatServer() {
       if (Date.now() - times.at(-1) > 60000) joins.delete(address);
   }, 15000);
   heartbeat.unref();
-  server.on("close", () => clearInterval(heartbeat));
+  server.on("close", () => {
+    clearInterval(heartbeat);
+    attachments.clear();
+  });
   server.stop = () => {
     for (const { response } of clients) response.end();
     server.close();

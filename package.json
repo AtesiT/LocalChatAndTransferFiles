@@ -1,9 +1,9 @@
 {
   "name": "local-chat-and-transfer-files",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "A shared, real-time chat for your local network.",
+  "description": "Terminal-style chat and temporary file sharing for your local network.",
   "engines": {
     "node": ">=20"
   },

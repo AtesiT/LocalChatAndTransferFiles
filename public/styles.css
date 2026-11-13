@@ -467,3 +467,47 @@ dialog button {
     font-size: 16px;
   }
 }
+
+.attachment {
+  display: block;
+  width: fit-content;
+  max-width: 100%;
+  color: var(--green);
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+.attachment:hover {
+  text-decoration: underline;
+}
+.attachment:focus-visible {
+  outline: 1px solid var(--green);
+  outline-offset: 2px;
+}
+.selected-file {
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+  padding: 0 0 8px;
+  font-size: 12px;
+}
+#file-status {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--cyan);
+}
+#remove-file {
+  flex-shrink: 0;
+  color: #d9b780;
+}
+@media (max-width: 640px) {
+  .command-line {
+    flex-wrap: wrap;
+  }
+  .command-line textarea {
+    flex: 1;
+    width: 0;
+  }
+  .selected-file {
+    font-size: 11px;
+  }
+}

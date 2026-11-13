@@ -10,6 +10,76 @@ let sending = false;
 let noticeTimer;
 let seen = new Set();
 let changingName = false;
+let selectedFile = null;
+let uploadedAttachment = null;
+let uploadRequest = null;
+let maxFileSize = 25 * 1024 * 1024;
+const fileInput = $("#file-input");
+const formatSize = (bytes) => {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+};
+function updateFile() {
+  $("#selected-file").hidden = !selectedFile;
+  $("#file-status").textContent = selectedFile
+    ? `[file] ${selectedFile.name} (${formatSize(selectedFile.size)})`
+    : "";
+}
+function clearFile() {
+  selectedFile = null;
+  uploadedAttachment = null;
+  fileInput.value = "";
+  updateFile();
+}
+function uploadFile(file) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    uploadRequest = xhr;
+    xhr.open("POST", "/api/files");
+    xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+    xhr.setRequestHeader("Content-Type", "application/octet-stream");
+    xhr.setRequestHeader("X-File-Name", encodeURIComponent(file.name));
+    xhr.responseType = "json";
+    xhr.timeout = 120000;
+    const progress = (label) => {
+      $("#file-status").textContent =
+        `[file] ${file.name} (${formatSize(file.size)}) / ${label}`;
+    };
+    progress("uploading 0%");
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable)
+        progress(
+          `uploading ${Math.round((event.loaded / event.total) * 100)}%`,
+        );
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300 && xhr.response?.attachment?.id)
+        resolve(xhr.response.attachment);
+      else
+        reject(
+          Object.assign(
+            new Error(
+              xhr.response?.error || "Upload failed. Please try again.",
+            ),
+            { status: xhr.status },
+          ),
+        );
+    };
+    xhr.onerror = () =>
+      reject(new Error("Upload failed. Check your connection and try again."));
+    xhr.ontimeout = () =>
+      reject(new Error("Upload timed out. Please try again."));
+    xhr.onabort = () =>
+      reject(new DOMException("Upload cancelled.", "AbortError"));
+    xhr.send(file);
+  }).finally(() => {
+    uploadRequest = null;
+    $("#remove-file").textContent = "[remove]";
+    updateFile();
+    updateComposer();
+  });
+}
 const storage = {
   get(key) {
     try {
@@ -57,7 +127,10 @@ function setConnection(value, label) {
 function updateComposer() {
   const length = [...input.value.trim()].length;
   $("#send-button").disabled =
-    !connected || sending || !length || length > 2000;
+    !connected || sending || (!length && !selectedFile) || length > 2000;
+  $("#attach-button").disabled = !connected || sending;
+  $("#identity").disabled = sending;
+  $("#remove-file").disabled = sending && !uploadRequest;
   $("#character-count").textContent =
     length > 1600 ? `${length.toLocaleString()} / 2,000` : "";
   $("#character-count").classList.toggle("over", length > 2000);
@@ -105,6 +178,14 @@ function renderMessage(message, history = false) {
   const text = document.createElement("div");
   text.className = "message-text";
   text.textContent = message.text;
+  if (message.attachment) {
+    const link = document.createElement("a");
+    link.className = "attachment";
+    link.href = `/api/files/${encodeURIComponent(message.attachment.id)}?token=${encodeURIComponent(token)}`;
+    link.download = message.attachment.name;
+    link.textContent = `[file] ${message.attachment.name} (${formatSize(message.attachment.size)}) ↓`;
+    text.append(link);
+  }
   article.append(time, name, text);
   messages.append(article);
   // Bound both the DOM and deduplication state during long conversations.
@@ -148,6 +229,9 @@ function connect() {
   stream.addEventListener("ready", (event) => {
     const data = JSON.parse(event.data);
     user = data.user;
+    maxFileSize = data.fileLimits.maxFileSize;
+    $("#attach-button").title =
+      `Attach a file (max ${formatSize(maxFileSize)})`;
     $("#my-name").textContent = user.name;
     storage.set("commonroom-name", user.name);
     const wasNearBottom = nearBottom();
@@ -202,6 +286,7 @@ $("#join-form").addEventListener("submit", async (event) => {
     const result = await api("/api/session", { name });
     token = result.token;
     user = result.user;
+    uploadedAttachment = null;
     storage.set("commonroom-token", token);
     storage.set("commonroom-name", user.name);
     changingName = false;
@@ -230,16 +315,29 @@ $("#message-form").addEventListener("submit", async (event) => {
   sending = true;
   updateComposer();
   try {
-    const result = await api("/api/messages", { text }, true);
+    if (selectedFile && !uploadedAttachment) {
+      $("#remove-file").textContent = "[cancel]";
+      $("#remove-file").disabled = false;
+      uploadedAttachment = await uploadFile(selectedFile);
+    }
+    const payload = { text };
+    if (uploadedAttachment) payload.attachmentId = uploadedAttachment.id;
+    const result = await api("/api/messages", payload, true);
+    clearFile();
+    clearTimeout(noticeTimer);
+    $("#notice").hidden = true;
     renderMessage(result.message);
     // Don't erase text typed while the send request was in flight.
     if (input.value === draft) input.value = "";
     scrollBottom();
   } catch (error) {
+    if (error.status === 400) uploadedAttachment = null;
     notice(
-      error instanceof TypeError
-        ? "Message not sent. Check your connection and try again."
-        : error.message,
+      error.name === "AbortError"
+        ? "Upload cancelled."
+        : error instanceof TypeError
+          ? "Message not sent. Check your connection and try again."
+          : error.message,
     );
     if (error.status === 401) {
       stream?.close();
@@ -251,6 +349,32 @@ $("#message-form").addEventListener("submit", async (event) => {
     updateComposer();
     input.focus();
   }
+});
+$("#attach-button").addEventListener("click", () => fileInput.click());
+fileInput.addEventListener("change", () => {
+  const file = fileInput.files[0];
+  if (!file) return;
+  if (file.size > maxFileSize) {
+    notice(`File is too large. Maximum size: ${formatSize(maxFileSize)}.`);
+    fileInput.value = "";
+    return;
+  }
+  if ([...file.name].length > 180) {
+    notice("File name is too long. Use up to 180 characters.");
+    fileInput.value = "";
+    return;
+  }
+  selectedFile = file;
+  uploadedAttachment = null;
+  updateFile();
+  updateComposer();
+  input.focus();
+});
+$("#remove-file").addEventListener("click", () => {
+  uploadRequest?.abort();
+  clearFile();
+  updateComposer();
+  input.focus();
 });
 input.addEventListener("input", updateComposer);
 input.addEventListener("keydown", (event) => {

@@ -30,7 +30,7 @@
           aria-relevant="additions"
         >
           <div id="empty-state" class="empty-state">
-            <p><span class="system-prefix">--</span> localchat v0.1.0</p>
+            <p><span class="system-prefix">--</span> localchat v0.2.0</p>
             <p>
               <span class="system-prefix">--</span> channel
               <strong>#general</strong> / history in memory
@@ -52,6 +52,12 @@
           [new messages ↓]
         </button>
         <div id="notice" class="notice" role="status" hidden></div>
+        <div id="selected-file" class="selected-file" hidden>
+          <span id="file-status" role="status"></span>
+          <button id="remove-file" type="button" aria-label="Remove attachment">
+            [remove]
+          </button>
+        </div>
         <form id="message-form" class="command-line">
           <div class="prompt">
             <button
@@ -73,6 +79,16 @@
             disabled
             spellcheck="false"
           ></textarea>
+          <input id="file-input" type="file" hidden />
+          <button
+            id="attach-button"
+            class="send"
+            type="button"
+            disabled
+            aria-label="Attach a file"
+          >
+            [attach]
+          </button>
           <button
             id="send-button"
             class="send"

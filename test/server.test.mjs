@@ -4,8 +4,8 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { createChatServer } from "../server.mjs";
 
-async function setup(t) {
-  const server = createChatServer();
+async function setup(t, limits) {
+  const server = createChatServer(limits);
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
   const base = `http://127.0.0.1:${server.address().port}`;
@@ -282,4 +282,240 @@ test("preserves UTF-8 characters split across incoming network packets", async (
   });
   assert.equal(result.status, 201);
   assert.equal(result.user.name, "Я😀");
+});
+
+async function upload(base, token, name, data, headers = {}) {
+  const response = await fetch(base + "/api/files", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/octet-stream",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      "X-File-Name": encodeURIComponent(name),
+      ...headers,
+    },
+    body: data,
+  });
+  return { status: response.status, ...(await response.json()) };
+}
+
+test("shares binary attachments via live chat, history and authenticated downloads", async (t) => {
+  const { base, post } = await setup(t);
+  const alice = await post("/api/session", { name: "Alice" });
+  const bob = await post("/api/session", { name: "Bob" });
+  const receiver = await events(base, bob.token, t);
+  await receiver.next("ready");
+  const bytes = Buffer.from([0, 255, 1, 13, 10, 128, 42]);
+  const name = 'проект 😀 "notes".bin';
+  const result = await upload(base, alice.token, name, bytes);
+  assert.equal(result.status, 201);
+  assert.equal(result.attachment.name, name);
+  assert.equal(result.attachment.size, bytes.length);
+  assert.equal("data" in result.attachment, false);
+  const path = `/api/files/${result.attachment.id}`;
+  assert.equal((await fetch(base + path)).status, 401);
+  assert.equal(
+    (await fetch(base + path + `?token=${bob.token}`)).status,
+    404,
+    "pending uploads are private",
+  );
+  assert.equal(
+    (
+      await post(
+        "/api/messages",
+        { attachmentId: result.attachment.id },
+        bob.token,
+      )
+    ).status,
+    400,
+  );
+  const sent = await post(
+    "/api/messages",
+    { text: "Binary test", attachmentId: result.attachment.id },
+    alice.token,
+  );
+  assert.equal(sent.status, 201);
+  assert.deepEqual(sent.message.attachment, result.attachment);
+  assert.deepEqual(await receiver.next("message"), sent.message);
+  assert.equal(
+    (
+      await post(
+        "/api/messages",
+        { attachmentId: result.attachment.id },
+        alice.token,
+      )
+    ).status,
+    400,
+    "attachments cannot be reused",
+  );
+  const download = await fetch(base + path + `?token=${bob.token}`);
+  assert.equal(download.status, 200);
+  assert.equal(
+    download.headers.get("content-type"),
+    "application/octet-stream",
+  );
+  assert.equal(download.headers.get("x-content-type-options"), "nosniff");
+  assert.match(download.headers.get("content-security-policy"), /sandbox/);
+  assert.match(download.headers.get("content-disposition"), /^attachment;/);
+  assert.ok(download.headers.get("content-disposition").includes("UTF-8''"));
+  assert.deepEqual(Buffer.from(await download.arrayBuffer()), bytes);
+  const head = await fetch(base + path, {
+    method: "HEAD",
+    headers: { Authorization: `Bearer ${alice.token}` },
+  });
+  assert.equal(head.status, 200);
+  assert.equal(head.headers.get("content-length"), String(bytes.length));
+  assert.equal((await head.arrayBuffer()).byteLength, 0);
+  const replay = await events(base, alice.token, t);
+  assert.deepEqual((await replay.next("ready")).messages, [sent.message]);
+  assert.equal(
+    (await fetch(base + "/api/files/../../server.mjs?token=" + bob.token))
+      .status,
+    404,
+  );
+});
+
+test("accepts attachment-only and empty-file messages; sanitizes file names", async (t) => {
+  const { base, post } = await setup(t);
+  const alice = await post("/api/session", { name: "Alice" });
+  const file = await upload(
+    base,
+    alice.token,
+    "../folder\\<img onerror=alert(1)>\r\n.html",
+    Buffer.alloc(0),
+  );
+  assert.equal(file.status, 201);
+  assert.equal(file.attachment.name, "<img onerror=alert(1)>__.html");
+  const sent = await post(
+    "/api/messages",
+    { attachmentId: file.attachment.id },
+    alice.token,
+  );
+  assert.equal(sent.status, 201);
+  assert.equal(sent.message.text, "");
+  const download = await fetch(
+    `${base}/api/files/${file.attachment.id}?token=${alice.token}`,
+  );
+  assert.equal(download.status, 200);
+  assert.equal((await download.arrayBuffer()).byteLength, 0);
+  assert.equal(
+    (await post("/api/messages", { attachmentId: {} }, alice.token)).status,
+    400,
+  );
+  assert.equal(
+    (await post("/api/messages", { attachmentId: "missing" }, alice.token))
+      .status,
+    400,
+  );
+});
+
+test("enforces upload validation, origin, per-file size and upload rate limits", async (t) => {
+  const { base, post } = await setup(t, { maxFileSize: 8 });
+  const alice = await post("/api/session", { name: "Alice" });
+  assert.equal((await upload(base, null, "a", "a")).status, 401);
+  assert.equal(
+    (
+      await upload(base, alice.token, "a", "a", {
+        Origin: "http://evil.example",
+      })
+    ).status,
+    403,
+  );
+  assert.equal(
+    (await upload(base, alice.token, "a", "a", { "Content-Type": "text/html" }))
+      .status,
+    415,
+  );
+  assert.equal((await upload(base, alice.token, "", "a")).status, 400);
+  assert.equal(
+    (await upload(base, alice.token, "a".repeat(181), "a")).status,
+    400,
+  );
+  assert.equal(
+    (await upload(base, alice.token, "a", "a", { "X-File-Name": "%ZZ" }))
+      .status,
+    400,
+  );
+  assert.equal(
+    (await upload(base, alice.token, "big", "123456789")).status,
+    413,
+  );
+  assert.equal(
+    (await upload(base, alice.token, "small", "12345678")).status,
+    201,
+  );
+  assert.equal((await upload(base, alice.token, "small", "1")).status, 201);
+  assert.equal((await upload(base, alice.token, "small", "1")).status, 429);
+});
+
+test("reclaims file storage when an attachment's message leaves history", async (t) => {
+  const { base, post } = await setup(t, { maxFileSize: 8, maxStorageSize: 8 });
+  const alice = await post("/api/session", { name: "Alice" });
+  const first = await upload(base, alice.token, "first.bin", Buffer.alloc(8));
+  assert.equal(first.status, 201);
+  assert.equal(
+    (
+      await post(
+        "/api/messages",
+        { attachmentId: first.attachment.id },
+        alice.token,
+      )
+    ).status,
+    201,
+  );
+  assert.equal(
+    (await upload(base, alice.token, "full.bin", Buffer.alloc(1))).status,
+    507,
+  );
+  for (let i = 0; i < 10; i++) {
+    const filler = await post("/api/session", { name: `Filler ${i}` });
+    for (let j = 0; j < 10; j++)
+      assert.equal(
+        (await post("/api/messages", { text: `${i}-${j}` }, filler.token))
+          .status,
+        201,
+      );
+  }
+  assert.equal(
+    (
+      await fetch(
+        `${base}/api/files/${first.attachment.id}?token=${alice.token}`,
+      )
+    ).status,
+    404,
+  );
+  assert.equal(
+    (await upload(base, alice.token, "new.bin", Buffer.alloc(8))).status,
+    201,
+  );
+});
+
+test("rejects oversized chunked uploads and remains usable afterward", async (t) => {
+  const { base, post } = await setup(t, { maxFileSize: 8 });
+  const alice = await post("/api/session", { name: "Alice" });
+  const status = await new Promise((resolve, reject) => {
+    const request = http.request(
+      base + "/api/files",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${alice.token}`,
+          "Content-Type": "application/octet-stream",
+          "X-File-Name": "chunked.bin",
+          "Transfer-Encoding": "chunked",
+        },
+      },
+      (response) => {
+        response.resume();
+        response.on("end", () => resolve(response.statusCode));
+      },
+    );
+    request.on("error", reject);
+    request.write("1234");
+    request.end("56789");
+  });
+  assert.equal(status, 413);
+  assert.equal(
+    (await upload(base, alice.token, "valid.bin", "12345678")).status,
+    201,
+  );
 });
