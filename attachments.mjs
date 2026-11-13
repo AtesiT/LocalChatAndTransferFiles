@@ -47,7 +47,7 @@ export class AttachmentStore {
     this.bytes = 0;
   }
 
-  async upload(request, ownerId) {
+  async upload(request, ownerId, roomName = "general") {
     this.prune();
     const { maxFileSize, maxStorageSize, maxConcurrentUploads, maxFiles } =
       this.limits;
@@ -100,6 +100,7 @@ export class AttachmentStore {
         name,
         data: Buffer.concat(chunks),
         ownerId,
+        roomName,
         attached: false,
         created: Date.now(),
       };

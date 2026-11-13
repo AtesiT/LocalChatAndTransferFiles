@@ -511,3 +511,69 @@ dialog button {
     font-size: 11px;
   }
 }
+
+#rooms-button {
+  color: var(--green);
+  margin-left: auto;
+  flex-shrink: 0;
+}
+#room-title {
+  overflow-wrap: anywhere;
+}
+.statusbar h1 {
+  min-width: 0;
+}
+#room-list {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 20px;
+  max-height: 180px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+#room-list button {
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+#rooms-dialog .login-line {
+  margin-bottom: 16px;
+}
+#rooms-dialog .room-help {
+  font-size: 10px;
+  margin: 0;
+}
+.room-actions {
+  display: flex;
+  gap: 20px;
+}
+#room-close {
+  margin-left: auto;
+  color: var(--muted);
+}
+#join-general {
+  margin-left: 16px;
+  color: var(--muted);
+}
+#join-password-field {
+  margin-top: 16px;
+}
+#join-password {
+  border-bottom: 1px solid var(--line);
+}
+#join-password:focus {
+  border-color: var(--green);
+}
+@media (max-width: 640px) {
+  .statusbar {
+    flex-wrap: wrap;
+  }
+  .statusbar h1 {
+    flex: 1;
+  }
+  #rooms-button {
+    font-size: 11px;
+  }
+  .connection {
+    margin-left: auto;
+  }
+}

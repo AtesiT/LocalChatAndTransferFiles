@@ -519,3 +519,258 @@ test("rejects oversized chunked uploads and remains usable afterward", async (t)
     201,
   );
 });
+
+test("creates public/protected rooms and validates room entry grants", async (t) => {
+  const { base, post } = await setup(t);
+  assert.equal((await fetch(base + "/api/rooms")).status, 401);
+  assert.equal(
+    (await post("/api/rooms", { name: "secret", password: "test-password" }))
+      .status,
+    401,
+  );
+  const alice = await post("/api/session", { name: "Alice" });
+  const secret = await post(
+    "/api/rooms",
+    { name: "secret", password: "test-password" },
+    alice.token,
+  );
+  assert.equal(secret.status, 201);
+  assert.deepEqual(secret.room, { name: "secret", protected: true });
+  assert.equal(secret.user.name, "Alice");
+  assert.equal(
+    (await post("/api/session", { name: "Bob", room: "secret" })).status,
+    403,
+  );
+  assert.equal(
+    (
+      await post(
+        "/api/session",
+        { name: "Bob", room: "secret", password: "wrong" },
+        alice.token,
+      )
+    ).status,
+    403,
+  );
+  const bob = await post("/api/session", {
+    name: "Bob",
+    room: "secret",
+    password: "test-password",
+  });
+  assert.equal(bob.status, 201);
+  const renamed = await post(
+    "/api/session",
+    { name: "Robert", room: "secret" },
+    bob.token,
+  );
+  assert.equal(
+    renamed.status,
+    201,
+    "an existing room grant permits nickname changes without re-entering the password",
+  );
+  const open = await post("/api/rooms", { name: "open" }, alice.token);
+  assert.equal(open.status, 201);
+  assert.deepEqual(open.room, { name: "open", protected: false });
+  assert.equal(
+    (await post("/api/session", { name: "Carol", room: "open" })).status,
+    201,
+  );
+  assert.equal(
+    (await post("/api/session", { name: "Carol", room: "missing" })).status,
+    404,
+  );
+  assert.equal(
+    (await post("/api/session", { name: "Carol", room: "../secret" })).status,
+    400,
+  );
+  assert.equal(
+    (await post("/api/rooms", { name: "secret" }, alice.token)).status,
+    409,
+  );
+  const listing = await fetch(base + "/api/rooms", {
+    headers: { Authorization: `Bearer ${alice.token}` },
+  });
+  assert.deepEqual(await listing.json(), {
+    rooms: [
+      { name: "general", protected: false },
+      { name: "secret", protected: true },
+      { name: "open", protected: false },
+    ],
+  });
+  const info = await fetch(base + "/api/session", {
+    headers: { Authorization: `Bearer ${bob.token}` },
+  });
+  assert.deepEqual((await info.json()).room, bob.room);
+});
+
+test("isolates live messages, history, presence and file downloads between rooms", async (t) => {
+  const { base, post } = await setup(t);
+  const publicUser = await post("/api/session", { name: "Public" });
+  const creator = await post(
+    "/api/rooms",
+    { name: "private", password: "test-password" },
+    publicUser.token,
+  );
+  const member = await post("/api/session", {
+    name: "Member",
+    room: "private",
+    password: "test-password",
+  });
+  const pub = await events(base, publicUser.token, t);
+  assert.deepEqual((await pub.next("ready")).users, [publicUser.user]);
+  const priv = await events(base, creator.token, t);
+  assert.deepEqual((await priv.next("ready")).users, [creator.user]);
+  const peer = await events(base, member.token, t);
+  assert.deepEqual((await peer.next("ready")).users, [
+    creator.user,
+    member.user,
+  ]);
+  const file = await upload(
+    base,
+    creator.token,
+    "private.txt",
+    "Private file contents",
+  );
+  const privateMessage = await post(
+    "/api/messages",
+    { text: "private message", attachmentId: file.attachment.id },
+    creator.token,
+  );
+  assert.equal(privateMessage.status, 201);
+  assert.deepEqual(await priv.next("message"), privateMessage.message);
+  assert.deepEqual(await peer.next("message"), privateMessage.message);
+  const publicMessage = await post(
+    "/api/messages",
+    { text: "public message", room: "private" },
+    publicUser.token,
+  );
+  assert.deepEqual(
+    await pub.next("message"),
+    publicMessage.message,
+    "private broadcasts do not reach the public stream; body fields cannot change room grants",
+  );
+  const secondPrivate = await post(
+    "/api/messages",
+    { text: "another private message" },
+    member.token,
+  );
+  assert.deepEqual(
+    await priv.next("message"),
+    secondPrivate.message,
+    "public broadcasts do not reach private streams",
+  );
+  const filePath = `${base}/api/files/${file.attachment.id}`;
+  assert.equal(
+    (await fetch(filePath + `?token=${publicUser.token}`)).status,
+    404,
+  );
+  assert.equal(
+    (await fetch(filePath + `?token=${publicUser.token}`, { method: "HEAD" }))
+      .status,
+    404,
+  );
+  const download = await fetch(filePath + `?token=${member.token}`);
+  assert.equal(download.status, 200);
+  assert.equal(await download.text(), "Private file contents");
+  const pending = await upload(base, creator.token, "pending.txt", "pending");
+  assert.equal(
+    (
+      await post(
+        "/api/messages",
+        { attachmentId: pending.attachment.id },
+        publicUser.token,
+      )
+    ).status,
+    400,
+  );
+  const publicReplay = await events(base, publicUser.token, t);
+  assert.deepEqual((await publicReplay.next("ready")).messages, [
+    publicMessage.message,
+  ]);
+  const privateReplay = await events(base, member.token, t);
+  assert.deepEqual((await privateReplay.next("ready")).messages, [
+    privateMessage.message,
+    secondPrivate.message,
+  ]);
+});
+
+test("public history eviction cannot remove private-room messages or files", async (t) => {
+  const { base, post } = await setup(t);
+  const publicUser = await post("/api/session", { name: "Public" });
+  const creator = await post(
+    "/api/rooms",
+    { name: "private", password: "test-password" },
+    publicUser.token,
+  );
+  const file = await upload(base, creator.token, "kept.txt", "Keep me");
+  const privateMessage = await post(
+    "/api/messages",
+    { attachmentId: file.attachment.id },
+    creator.token,
+  );
+  for (let i = 0; i < 10; i++) {
+    const filler = await post("/api/session", { name: `Filler ${i}` });
+    for (let j = 0; j < 10; j++)
+      assert.equal(
+        (await post("/api/messages", { text: `${i}-${j}` }, filler.token))
+          .status,
+        201,
+      );
+  }
+  const replay = await events(base, creator.token, t);
+  assert.deepEqual((await replay.next("ready")).messages, [
+    privateMessage.message,
+  ]);
+  assert.equal(
+    (
+      await fetch(
+        `${base}/api/files/${file.attachment.id}?token=${creator.token}`,
+      )
+    ).status,
+    200,
+  );
+});
+
+test("throttles password guessing and room creation", async (t) => {
+  const { post } = await setup(t);
+  const user = await post("/api/session", { name: "User" });
+  assert.equal(
+    (
+      await post(
+        "/api/rooms",
+        { name: "secret", password: "test-password" },
+        user.token,
+      )
+    ).status,
+    201,
+  );
+  for (let i = 0; i < 10; i++)
+    assert.equal(
+      (
+        await post("/api/session", {
+          name: "Guest",
+          room: "secret",
+          password: "wrong",
+        })
+      ).status,
+      403,
+    );
+  assert.equal(
+    (
+      await post("/api/session", {
+        name: "Guest",
+        room: "secret",
+        password: "test-password",
+      })
+    ).status,
+    429,
+  );
+  for (let i = 0; i < 4; i++)
+    assert.equal(
+      (await post("/api/rooms", { name: `open-${i}` }, user.token)).status,
+      201,
+    );
+  assert.equal(
+    (await post("/api/rooms", { name: "too-many" }, user.token)).status,
+    429,
+  );
+});

@@ -10,6 +10,10 @@ let sending = false;
 let noticeTimer;
 let seen = new Set();
 let changingName = false;
+let currentRoom = { name: "general", protected: false };
+let roomBusy = false;
+const drafts = new Map();
+const roomDialog = $("#rooms-dialog");
 let selectedFile = null;
 let uploadedAttachment = null;
 let uploadRequest = null;
@@ -127,9 +131,14 @@ function setConnection(value, label) {
 function updateComposer() {
   const length = [...input.value.trim()].length;
   $("#send-button").disabled =
-    !connected || sending || (!length && !selectedFile) || length > 2000;
+    !connected ||
+    sending ||
+    roomBusy ||
+    (!length && !selectedFile) ||
+    length > 2000;
   $("#attach-button").disabled = !connected || sending;
-  $("#identity").disabled = sending;
+  $("#identity").disabled = sending || roomBusy;
+  $("#rooms-button").disabled = !connected || sending || roomBusy;
   $("#remove-file").disabled = sending && !uploadRequest;
   $("#character-count").textContent =
     length > 1600 ? `${length.toLocaleString()} / 2,000` : "";
@@ -212,9 +221,54 @@ async function api(path, data, auth = false) {
     });
   return result;
 }
+function setRoom(room) {
+  if (currentRoom.name !== room.name) {
+    // A private-room draft must never silently become a public-room message.
+    drafts.set(currentRoom.name, { text: input.value, file: selectedFile });
+    const draft = drafts.get(room.name);
+    input.value = draft?.text || "";
+    selectedFile = draft?.file || null;
+    uploadedAttachment = null;
+    fileInput.value = "";
+    updateFile();
+    messages.querySelectorAll(".message").forEach((node) => node.remove());
+    seen = new Set();
+    $("#empty-state").hidden = false;
+    $("#new-messages").hidden = true;
+    renderPeople([]);
+    $("#notice").hidden = true;
+  }
+  currentRoom = room;
+  storage.set("localchat-room", JSON.stringify(room));
+  $("#room-title").textContent =
+    ` / #${room.name}${room.protected ? " [locked]" : ""}`;
+  $("#prompt-room").textContent = `@${room.name}`;
+  $("#empty-room").textContent = `#${room.name}`;
+  $("#message-input").labels[0].textContent = `Message #${room.name}`;
+  document.title = `localchat / #${room.name}`;
+  updateComposer();
+}
+function acceptSession(result) {
+  setRoom(result.room);
+  token = result.token;
+  user = result.user;
+  uploadedAttachment = null;
+  storage.set("commonroom-token", token);
+  storage.set("commonroom-name", user.name);
+  $("#join-password").value = "";
+  $("#room-password").value = "";
+  changingName = false;
+  connect();
+}
 function openJoin() {
   $("#name-input").value = user?.name || storage.get("commonroom-name") || "";
   $("#join-error").textContent = "";
+  $("#join-description").textContent =
+    `Choose a nickname for #${currentRoom.name}.`;
+  const needsPassword = currentRoom.protected && !connected;
+  $("#join-password-field").hidden = !needsPassword;
+  $("#join-password").required = needsPassword;
+  $("#join-general").hidden = connected || currentRoom.name === "general";
   if (!dialog.open) dialog.showModal();
   $("#name-input").focus();
 }
@@ -227,8 +281,10 @@ function connect() {
   );
   stream = source;
   stream.addEventListener("ready", (event) => {
+    if (stream !== source) return;
     const data = JSON.parse(event.data);
     user = data.user;
+    setRoom(data.room);
     maxFileSize = data.fileLimits.maxFileSize;
     $("#attach-button").title =
       `Attach a file (max ${formatSize(maxFileSize)})`;
@@ -247,13 +303,14 @@ function connect() {
     if (dialog.open) dialog.close();
     input.focus();
   });
-  stream.addEventListener("message", (event) =>
-    renderMessage(JSON.parse(event.data)),
-  );
-  stream.addEventListener("presence", (event) =>
-    renderPeople(JSON.parse(event.data)),
-  );
+  stream.addEventListener("message", (event) => {
+    if (stream === source) renderMessage(JSON.parse(event.data));
+  });
+  stream.addEventListener("presence", (event) => {
+    if (stream === source) renderPeople(JSON.parse(event.data));
+  });
   stream.onerror = async () => {
+    if (stream !== source) return;
     setConnection(false, "reconnecting");
     // SSE retries automatically. Check for a restarted server / expired session.
     try {
@@ -266,6 +323,7 @@ function connect() {
         stream.close();
         storage.remove("commonroom-token");
         setConnection(false, "login required");
+        roomDialog.close();
         openJoin();
       }
     } catch {
@@ -283,14 +341,12 @@ $("#join-form").addEventListener("submit", async (event) => {
   $("#join-button").disabled = true;
   $("#join-error").textContent = "";
   try {
-    const result = await api("/api/session", { name });
-    token = result.token;
-    user = result.user;
-    uploadedAttachment = null;
-    storage.set("commonroom-token", token);
-    storage.set("commonroom-name", user.name);
-    changingName = false;
-    connect();
+    const result = await api(
+      "/api/session",
+      { name, room: currentRoom.name, password: $("#join-password").value },
+      !!token,
+    );
+    acceptSession(result);
   } catch (error) {
     $("#join-error").textContent =
       error instanceof TypeError
@@ -306,6 +362,90 @@ dialog.addEventListener("cancel", (event) => {
 $("#identity").addEventListener("click", () => {
   changingName = connected;
   openJoin();
+});
+$("#join-general").addEventListener("click", () => {
+  token = null;
+  storage.remove("commonroom-token");
+  setRoom({ name: "general", protected: false });
+  openJoin();
+});
+dialog.addEventListener("close", () => {
+  $("#join-password").value = "";
+});
+roomDialog.addEventListener("close", () => {
+  $("#room-password").value = "";
+});
+roomDialog.addEventListener("cancel", (event) => {
+  if (roomBusy) event.preventDefault();
+});
+$("#room-close").addEventListener("click", () => roomDialog.close());
+$("#rooms-button").addEventListener("click", async () => {
+  $("#room-error").textContent = "";
+  $("#room-name").value = currentRoom.name;
+  $("#room-password").value = "";
+  $("#room-list").textContent = "loading…";
+  roomDialog.showModal();
+  $("#room-name").focus();
+  try {
+    const response = await fetch("/api/rooms", {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error);
+    $("#room-list").replaceChildren();
+    for (const room of data.rooms) {
+      const li = document.createElement("li");
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = `#${room.name}${room.protected ? " [locked]" : ""}${room.name === currentRoom.name ? " *" : ""}`;
+      button.addEventListener("click", () => {
+        $("#room-name").value = room.name;
+        $("#room-password").value = "";
+        (room.protected ? $("#room-password") : $("#room-join")).focus();
+      });
+      li.append(button);
+      $("#room-list").append(li);
+    }
+  } catch (error) {
+    $("#room-list").replaceChildren();
+    $("#room-error").textContent = error.message;
+  }
+});
+$("#rooms-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (roomBusy || sending) return;
+  const name = $("#room-name").value;
+  const password = $("#room-password").value;
+  roomBusy = true;
+  for (const button of roomDialog.querySelectorAll("button"))
+    button.disabled = true;
+  $("#room-error").textContent = "";
+  updateComposer();
+  try {
+    const result =
+      event.submitter?.id === "room-create"
+        ? await api("/api/rooms", { name, password }, true)
+        : await api(
+            "/api/session",
+            { name: user.name, room: name, password },
+            true,
+          );
+    roomDialog.close();
+    acceptSession(result);
+  } catch (error) {
+    $("#room-error").textContent =
+      error instanceof TypeError ? "Cannot reach the server." : error.message;
+    if (error.status === 401) {
+      roomDialog.close();
+      setConnection(false, "login required");
+      openJoin();
+    }
+  } finally {
+    roomBusy = false;
+    for (const button of roomDialog.querySelectorAll("button"))
+      button.disabled = false;
+    updateComposer();
+  }
 });
 $("#message-form").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -391,6 +531,17 @@ window.addEventListener("pagehide", () => stream?.close());
 window.addEventListener("pageshow", (event) => {
   if (event.persisted && token) connect();
 });
+try {
+  const savedRoom = JSON.parse(storage.get("localchat-room"));
+  if (
+    savedRoom &&
+    typeof savedRoom.name === "string" &&
+    /^[a-z0-9][a-z0-9_-]{0,31}$/.test(savedRoom.name)
+  )
+    setRoom({ name: savedRoom.name, protected: !!savedRoom.protected });
+} catch {
+  /* Ignore invalid optional storage. */
+}
 token = storage.get("commonroom-token");
 if (token) connect();
 else openJoin();

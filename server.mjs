@@ -5,6 +5,7 @@ import { networkInterfaces } from "node:os";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 import { AttachmentStore, downloadDisposition } from "./attachments.mjs";
+import { RoomStore, roomInfo } from "./rooms.mjs";
 
 const MAX_MESSAGES = 100;
 const MAX_LENGTH = 2000;
@@ -19,18 +20,60 @@ export function createChatServer(fileLimits = {}) {
   const attachments = new AttachmentStore(fileLimits);
   const sessions = new Map();
   const clients = new Set();
-  const messages = [];
+  const rooms = new RoomStore();
+  const roomAttempts = new Map();
+  const roomCreations = new Map();
   const joins = new Map();
   const send = (response, event, data) => {
     if (!response.destroyed)
       response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   };
-  const online = () =>
+  const online = (roomName) =>
     [...sessions.values()]
-      .filter((session) => session.connections > 0)
+      .filter(
+        (session) => session.connections > 0 && session.roomName === roomName,
+      )
       .map(({ id, name }) => ({ id, name }));
-  const broadcast = (event, data) => {
-    for (const client of clients) send(client.response, event, data);
+  const broadcast = (roomName, event, data) => {
+    for (const client of clients)
+      if (client.session.roomName === roomName)
+        send(client.response, event, data);
+  };
+  const issueSession = (name, roomName) => {
+    const token = randomBytes(32).toString("hex");
+    const session = {
+      id: randomUUID(),
+      name,
+      roomName,
+      connections: 0,
+      touched: Date.now(),
+      sent: [],
+    };
+    sessions.set(token, session);
+    return {
+      token,
+      user: { id: session.id, name },
+      room: roomInfo(rooms.get(roomName)),
+    };
+  };
+  const authenticate = (request, token) => {
+    token ||= request.headers.authorization?.replace(/^Bearer /, "");
+    const session = sessions.get(token);
+    return session && Date.now() - session.touched <= SESSION_TTL
+      ? session
+      : null;
+  };
+  const throttle = (map, address, limit) => {
+    const attempts = (map.get(address) || []).filter(
+      (time) => Date.now() - time < 60000,
+    );
+    if (attempts.length >= limit)
+      throw Object.assign(
+        new Error("Too many room attempts. Try again in a minute."),
+        { status: 429 },
+      );
+    attempts.push(Date.now());
+    map.set(address, attempts);
   };
   const json = (response, status, data) => {
     if (status >= 400 && !response.req.complete) response.req.resume();
@@ -102,11 +145,26 @@ export function createChatServer(fileLimits = {}) {
             });
           session.uploads.push(Date.now());
           session.touched = Date.now();
-          const attachment = await attachments.upload(request, session.id);
+          const attachment = await attachments.upload(
+            request,
+            session.id,
+            session.roomName,
+          );
           return json(response, 201, { attachment });
         }
         if (!request.headers["content-type"]?.startsWith("application/json"))
           return json(response, 415, { error: "Use application/json." });
+        if (url.pathname === "/api/rooms") {
+          const session = authenticate(request);
+          if (!session)
+            return json(response, 401, {
+              error: "Please join the chat again.",
+            });
+          throttle(roomCreations, request.socket.remoteAddress, 5);
+          const input = await body(request);
+          const room = await rooms.create(input?.name, input?.password);
+          return json(response, 201, issueSession(session.name, room.name));
+        }
         if (url.pathname === "/api/session") {
           const address = request.socket.remoteAddress;
           const attempts = (joins.get(address) || []).filter(
@@ -127,16 +185,21 @@ export function createChatServer(fileLimits = {}) {
             return json(response, 400, {
               error: "Choose a name between 1 and 24 characters.",
             });
-          const token = randomBytes(32).toString("hex");
-          const session = {
-            id: randomUUID(),
-            name,
-            connections: 0,
-            touched: Date.now(),
-            sent: [],
-          };
-          sessions.set(token, session);
-          return json(response, 201, { token, user: { id: session.id, name } });
+          const roomName = input?.room ?? "general";
+          rooms.validateName(roomName);
+          const room = rooms.get(roomName);
+          if (!room)
+            return json(response, 404, {
+              error: "Room not found. Create it or use #general.",
+            });
+          const existing = authenticate(request);
+          // Renaming within the same room may reuse its existing session grant.
+          if (room.hash && existing?.roomName !== roomName) {
+            throttle(roomAttempts, request.socket.remoteAddress, 10);
+            if (!(await rooms.verify(room, input?.password)))
+              return json(response, 403, { error: "Incorrect room password." });
+          }
+          return json(response, 201, issueSession(name, roomName));
         }
         if (url.pathname === "/api/messages") {
           const token = request.headers.authorization?.replace(/^Bearer /, "");
@@ -154,7 +217,10 @@ export function createChatServer(fileLimits = {}) {
           const file = attachmentId ? attachments.get(attachmentId) : null;
           if (
             attachmentId &&
-            (!file || file.attached || file.ownerId !== session.id)
+            (!file ||
+              file.attached ||
+              file.ownerId !== session.id ||
+              file.roomName !== session.roomName)
           )
             return json(response, 400, {
               error: "Attachment is unavailable. Please upload it again.",
@@ -184,12 +250,13 @@ export function createChatServer(fileLimits = {}) {
             file.attached = true;
             message.attachment = attachments.metadata(file);
           }
+          const messages = rooms.get(session.roomName).messages;
           messages.push(message);
           if (messages.length > MAX_MESSAGES) {
             const removed = messages.shift();
             if (removed.attachment) attachments.remove(removed.attachment.id);
           }
-          broadcast("message", message);
+          broadcast(session.roomName, "message", message);
           return json(response, 201, { message });
         }
       }
@@ -205,7 +272,7 @@ export function createChatServer(fileLimits = {}) {
           return json(response, 401, { error: "Please join the chat again." });
         const file = attachments.get(url.pathname.slice("/api/files/".length));
         // Pending uploads stay private, even to other logged-in participants.
-        if (!file?.attached)
+        if (!file?.attached || file.roomName !== session.roomName)
           return json(response, 404, { error: "File is no longer available." });
         session.touched = Date.now();
         response.writeHead(200, {
@@ -216,6 +283,11 @@ export function createChatServer(fileLimits = {}) {
         });
         return response.end(request.method === "HEAD" ? undefined : file.data);
       }
+      if (request.method === "GET" && url.pathname === "/api/rooms") {
+        if (!authenticate(request))
+          return json(response, 401, { error: "Please join the chat again." });
+        return json(response, 200, { rooms: rooms.list() });
+      }
       if (request.method === "GET" && url.pathname === "/api/session") {
         const token = request.headers.authorization?.replace(/^Bearer /, "");
         const session = sessions.get(token);
@@ -223,6 +295,7 @@ export function createChatServer(fileLimits = {}) {
           return json(response, 401, { error: "Please join the chat again." });
         return json(response, 200, {
           user: { id: session.id, name: session.name },
+          room: roomInfo(rooms.get(session.roomName)),
         });
       }
       if (request.method === "GET" && url.pathname === "/api/events") {
@@ -241,16 +314,17 @@ export function createChatServer(fileLimits = {}) {
         clients.add(client);
         send(response, "ready", {
           user: { id: session.id, name: session.name },
-          messages,
-          users: online(),
+          messages: rooms.get(session.roomName).messages,
+          room: roomInfo(rooms.get(session.roomName)),
+          users: online(session.roomName),
           fileLimits: attachments.limits,
         });
-        broadcast("presence", online());
+        broadcast(session.roomName, "presence", online(session.roomName));
         response.on("close", () => {
           clients.delete(client);
           session.connections--;
           session.touched = Date.now();
-          broadcast("presence", online());
+          broadcast(session.roomName, "presence", online(session.roomName));
         });
         return;
       }
@@ -291,8 +365,10 @@ export function createChatServer(fileLimits = {}) {
     for (const [token, session] of sessions)
       if (!session.connections && Date.now() - session.touched > SESSION_TTL)
         sessions.delete(token);
-    for (const [address, times] of joins)
-      if (Date.now() - times.at(-1) > 60000) joins.delete(address);
+    for (const map of [joins, roomAttempts, roomCreations]) {
+      for (const [address, times] of map)
+        if (Date.now() - times.at(-1) > 60000) map.delete(address);
+    }
   }, 15000);
   heartbeat.unref();
   server.on("close", () => {

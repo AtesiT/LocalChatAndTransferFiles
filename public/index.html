@@ -15,7 +15,8 @@
   <body>
     <main class="terminal">
       <header class="statusbar">
-        <h1>localchat<span class="path"> / #general</span></h1>
+        <h1>localchat<span id="room-title" class="path"> / #general</span></h1>
+        <button id="rooms-button" type="button" disabled>[rooms]</button>
         <span id="connection-text" class="connection" role="status"
           >[offline]</span
         >
@@ -30,10 +31,10 @@
           aria-relevant="additions"
         >
           <div id="empty-state" class="empty-state">
-            <p><span class="system-prefix">--</span> localchat v0.2.0</p>
+            <p><span class="system-prefix">--</span> localchat v0.3.0</p>
             <p>
               <span class="system-prefix">--</span> channel
-              <strong>#general</strong> / history in memory
+              <strong id="empty-room">#general</strong> / history in memory
             </p>
             <p>
               <span class="system-prefix">--</span> No messages. Type below to
@@ -67,7 +68,7 @@
               aria-label="Change nickname"
             >
               <span id="my-name">guest</span></button
-            ><span class="prompt-path">@general</span
+            ><span id="prompt-room" class="prompt-path">@general</span
             ><span class="prompt-symbol">:$</span>
           </div>
           <label class="sr-only" for="message-input">Message #general</label>
@@ -112,7 +113,7 @@
     <dialog id="join-dialog" aria-labelledby="join-title">
       <form id="join-form">
         <h2 id="join-title">localchat / connect</h2>
-        <p>Choose a nickname for #general.</p>
+        <p id="join-description">Choose a nickname for #general.</p>
         <label for="name-input">login:</label>
         <div class="login-line">
           <span aria-hidden="true">&gt;</span
@@ -127,8 +128,57 @@
             autofocus
           />
         </div>
+        <div id="join-password-field" hidden>
+          <label for="join-password">room password:</label>
+          <input
+            id="join-password"
+            type="password"
+            autocomplete="current-password"
+            maxlength="256"
+          />
+        </div>
         <p id="join-error" class="error" role="alert"></p>
         <button id="join-button" type="submit">[connect]</button>
+        <button id="join-general" type="button" hidden>[use #general]</button>
+      </form>
+    </dialog>
+    <dialog id="rooms-dialog" aria-labelledby="rooms-title">
+      <form id="rooms-form">
+        <h2 id="rooms-title">localchat / rooms</h2>
+        <ul id="room-list" aria-label="Available rooms"></ul>
+        <label for="room-name">room:</label>
+        <div class="login-line">
+          <span aria-hidden="true">#</span
+          ><input
+            id="room-name"
+            placeholder="room-name"
+            pattern="[a-z0-9][a-z0-9_\-]{0,31}"
+            maxlength="32"
+            required
+            autocapitalize="none"
+            spellcheck="false"
+          />
+        </div>
+        <label for="room-password">password:</label>
+        <div class="login-line">
+          <span aria-hidden="true">&gt;</span
+          ><input
+            id="room-password"
+            type="password"
+            autocomplete="current-password"
+            maxlength="256"
+          />
+        </div>
+        <p class="room-help">
+          Blank password creates a public room.<br />Room names are visible to
+          everyone.
+        </p>
+        <p id="room-error" class="error" role="alert"></p>
+        <div class="room-actions">
+          <button id="room-join" type="submit">[join]</button
+          ><button id="room-create" type="submit">[create]</button
+          ><button id="room-close" type="button">[close]</button>
+        </div>
       </form>
     </dialog>
   </body>
