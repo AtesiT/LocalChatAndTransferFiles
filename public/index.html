@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#101311" />
+    <title>localchat / #general</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' fill='%23101311'/%3E%3Ctext x='5' y='29' font-family='monospace' font-size='27' fill='%239dcc87'%3E%3E_%3C/text%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <main class="terminal">
+      <header class="statusbar">
+        <h1>localchat<span class="path"> / #general</span></h1>
+        <span id="connection-text" class="connection" role="status"
+          >[offline]</span
+        >
+      </header>
+      <div class="workspace">
+        <section
+          id="messages"
+          class="messages"
+          role="log"
+          aria-label="Chat messages"
+          aria-live="polite"
+          aria-relevant="additions"
+        >
+          <div id="empty-state" class="empty-state">
+            <p><span class="system-prefix">--</span> localchat v0.1.0</p>
+            <p>
+              <span class="system-prefix">--</span> channel
+              <strong>#general</strong> / history in memory
+            </p>
+            <p>
+              <span class="system-prefix">--</span> No messages. Type below to
+              begin.
+            </p>
+          </div>
+        </section>
+        <aside class="roster" aria-label="Online users">
+          <h2>users <span id="people-count">0</span></h2>
+          <ul id="people-list"></ul>
+          <p id="no-people" class="muted">(no users)</p>
+        </aside>
+      </div>
+      <div class="input-area">
+        <button id="new-messages" class="new-messages" hidden>
+          [new messages ↓]
+        </button>
+        <div id="notice" class="notice" role="status" hidden></div>
+        <form id="message-form" class="command-line">
+          <div class="prompt">
+            <button
+              id="identity"
+              type="button"
+              title="Change nickname"
+              aria-label="Change nickname"
+            >
+              <span id="my-name">guest</span></button
+            ><span class="prompt-path">@general</span
+            ><span class="prompt-symbol">:$</span>
+          </div>
+          <label class="sr-only" for="message-input">Message #general</label>
+          <textarea
+            id="message-input"
+            placeholder="type a message…"
+            rows="1"
+            maxlength="4000"
+            disabled
+            spellcheck="false"
+          ></textarea>
+          <button
+            id="send-button"
+            class="send"
+            type="submit"
+            disabled
+            aria-label="Send message"
+          >
+            [send]
+          </button>
+        </form>
+        <footer class="help">
+          <span
+            >Enter send <span class="separator">/</span> Shift+Enter newline
+            <span class="rename-hint"
+              ><span class="separator">/</span> click nick to rename</span
+            ></span
+          ><span id="character-count"></span>
+        </footer>
+      </div>
+    </main>
+    <dialog id="join-dialog" aria-labelledby="join-title">
+      <form id="join-form">
+        <h2 id="join-title">localchat / connect</h2>
+        <p>Choose a nickname for #general.</p>
+        <label for="name-input">login:</label>
+        <div class="login-line">
+          <span aria-hidden="true">&gt;</span
+          ><input
+            id="name-input"
+            name="name"
+            autocomplete="nickname"
+            placeholder="nickname"
+            maxlength="48"
+            required
+            spellcheck="false"
+            autofocus
+          />
+        </div>
+        <p id="join-error" class="error" role="alert"></p>
+        <button id="join-button" type="submit">[connect]</button>
+      </form>
+    </dialog>
+  </body>
+</html>
