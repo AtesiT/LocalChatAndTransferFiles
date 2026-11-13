@@ -12,11 +12,14 @@ test("stores salted password hashes, never exposes them in room listings", async
   assert.equal(await store.verify(first, "пароль 🔐"), true);
   assert.equal(await store.verify(first, "wrong"), false);
   assert.equal(await store.verify(first, ""), false);
-  assert.deepEqual(store.list(), [
-    { name: "general", protected: false },
-    { name: "first", protected: true },
-    { name: "second", protected: true },
-  ]);
+  assert.deepEqual(
+    store.list().map(({ id, ...info }) => info),
+    [
+      { name: "general", protected: false },
+      { name: "first", protected: true },
+      { name: "second", protected: true },
+    ],
+  );
 });
 
 test("prevents concurrent duplicate creation and bounds rooms and password work", async () => {

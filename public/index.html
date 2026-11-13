@@ -17,9 +17,7 @@
       <header class="statusbar">
         <h1>localchat<span id="room-title" class="path"> / #general</span></h1>
         <button id="rooms-button" type="button" disabled>[rooms]</button>
-        <span id="connection-text" class="connection" role="status"
-          >[offline]</span
-        >
+        <button id="settings-button" type="button">[settings]</button>
       </header>
       <div class="workspace">
         <section
@@ -31,7 +29,7 @@
           aria-relevant="additions"
         >
           <div id="empty-state" class="empty-state">
-            <p><span class="system-prefix">--</span> localchat v0.3.0</p>
+            <p><span class="system-prefix">--</span> localchat v0.4.0</p>
             <p>
               <span class="system-prefix">--</span> channel
               <strong id="empty-room">#general</strong> / history in memory
@@ -52,6 +50,7 @@
         <button id="new-messages" class="new-messages" hidden>
           [new messages ↓]
         </button>
+        <span id="connection-text" class="sr-only" role="status"></span>
         <div id="notice" class="notice" role="status" hidden></div>
         <div id="selected-file" class="selected-file" hidden>
           <span id="file-status" role="status"></span>
@@ -111,75 +110,146 @@
       </div>
     </main>
     <dialog id="join-dialog" aria-labelledby="join-title">
-      <form id="join-form">
+      <section id="join-panel" autocomplete="off">
         <h2 id="join-title">localchat / connect</h2>
-        <p id="join-description">Choose a nickname for #general.</p>
-        <label for="name-input">login:</label>
-        <div class="login-line">
-          <span aria-hidden="true">&gt;</span
-          ><input
-            id="name-input"
-            name="name"
-            autocomplete="nickname"
-            placeholder="nickname"
-            maxlength="48"
-            required
-            spellcheck="false"
-            autofocus
-          />
+        <div id="nickname-step">
+          <label for="name-input">nickname:</label>
+          <div class="login-line">
+            <span aria-hidden="true">&gt;</span
+            ><input
+              id="name-input"
+              autocomplete="off"
+              placeholder="nickname"
+              maxlength="48"
+              spellcheck="false"
+              data-lpignore="true"
+              data-1p-ignore="true"
+              autofocus
+            />
+          </div>
+          <button id="nickname-next" type="button">[continue]</button>
         </div>
-        <div id="join-password-field" hidden>
-          <label for="join-password">room password:</label>
-          <input
-            id="join-password"
-            type="password"
-            autocomplete="current-password"
-            maxlength="256"
-          />
+        <div id="room-step" hidden>
+          <p class="room-help">Choose a room. Numbers show people online.</p>
+          <ul
+            id="entry-room-list"
+            class="room-list"
+            aria-label="Available rooms"
+          ></ul>
+          <div id="join-password-field" hidden>
+            <label id="join-password-label" for="join-password"
+              >room password:</label
+            >
+            <div class="login-line">
+              <span aria-hidden="true">&gt;</span
+              ><input
+                id="join-password"
+                type="password"
+                autocomplete="off"
+                maxlength="256"
+                data-lpignore="true"
+                data-1p-ignore="true"
+              />
+            </div>
+          </div>
+          <div class="room-actions">
+            <button id="join-button" type="button" hidden>[join]</button
+            ><button id="open-create" type="button">[create room]</button
+            ><button id="entry-back" type="button">[change nick]</button
+            ><button id="entry-close" type="button" hidden>[close]</button>
+          </div>
         </div>
         <p id="join-error" class="error" role="alert"></p>
-        <button id="join-button" type="submit">[connect]</button>
-        <button id="join-general" type="button" hidden>[use #general]</button>
-      </form>
+      </section>
     </dialog>
-    <dialog id="rooms-dialog" aria-labelledby="rooms-title">
-      <form id="rooms-form">
-        <h2 id="rooms-title">localchat / rooms</h2>
-        <ul id="room-list" aria-label="Available rooms"></ul>
-        <label for="room-name">room:</label>
+    <dialog id="create-dialog" aria-labelledby="create-title">
+      <section autocomplete="off">
+        <h2 id="create-title">localchat / create room</h2>
+        <label for="create-name">room name:</label>
         <div class="login-line">
           <span aria-hidden="true">#</span
           ><input
-            id="room-name"
-            placeholder="room-name"
-            pattern="[a-z0-9][a-z0-9_\-]{0,31}"
+            id="create-name"
+            autocomplete="off"
             maxlength="32"
-            required
+            placeholder="room-name"
             autocapitalize="none"
             spellcheck="false"
           />
         </div>
-        <label for="room-password">password:</label>
+        <label for="create-password">room password (optional):</label>
         <div class="login-line">
           <span aria-hidden="true">&gt;</span
           ><input
-            id="room-password"
+            id="create-password"
             type="password"
-            autocomplete="current-password"
+            autocomplete="off"
             maxlength="256"
+            data-lpignore="true"
+            data-1p-ignore="true"
           />
         </div>
         <p class="room-help">
-          Blank password creates a public room.<br />Room names are visible to
-          everyone.
+          Blank = public. Names: a-z, 0-9, _ or -.<br />Empty rooms close after
+          15 seconds. #general stays open.
         </p>
-        <p id="room-error" class="error" role="alert"></p>
+        <p id="create-error" class="error" role="alert"></p>
         <div class="room-actions">
-          <button id="room-join" type="submit">[join]</button
-          ><button id="room-create" type="submit">[create]</button
-          ><button id="room-close" type="button">[close]</button>
+          <button id="create-button" type="button">[create]</button
+          ><button id="create-back" type="button">[back]</button>
+        </div>
+      </section>
+    </dialog>
+    <dialog id="rename-dialog" aria-labelledby="rename-title">
+      <form id="rename-form" autocomplete="off">
+        <h2 id="rename-title">localchat / nickname</h2>
+        <label for="rename-name">nickname:</label>
+        <div class="login-line">
+          <span aria-hidden="true">&gt;</span
+          ><input
+            id="rename-name"
+            autocomplete="off"
+            maxlength="48"
+            required
+            spellcheck="false"
+          />
+        </div>
+        <p id="rename-error" class="error" role="alert"></p>
+        <div class="room-actions">
+          <button type="submit">[save]</button
+          ><button id="rename-close" type="button">[close]</button>
         </div>
       </form>
+    </dialog>
+    <dialog id="settings-dialog" aria-labelledby="settings-title">
+      <section>
+        <h2 id="settings-title">localchat / settings</h2>
+        <label for="notification-sound">notification sound:</label>
+        <select id="notification-sound"></select>
+        <label for="notification-volume"
+          >volume:
+          <output id="volume-value" for="notification-volume"
+            >35%</output
+          ></label
+        >
+        <input
+          id="notification-volume"
+          type="range"
+          min="0"
+          max="100"
+          step="1"
+          value="35"
+        />
+        <p class="room-help">
+          New messages from others in your room only.<br />Settings are saved on
+          this device.
+        </p>
+        <p id="audio-status" class="error" role="status"></p>
+        <div class="room-actions">
+          <button id="test-sound" type="button">[test sound]</button
+          ><button id="settings-close" type="button">[close]</button>
+        </div>
+      </section>
     </dialog>
   </body>
 </html>

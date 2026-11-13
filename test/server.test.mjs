@@ -4,8 +4,8 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { createChatServer } from "../server.mjs";
 
-async function setup(t, limits) {
-  const server = createChatServer(limits);
+async function setup(t, limits, options) {
+  const server = createChatServer(limits, options);
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
   const base = `http://127.0.0.1:${server.address().port}`;
@@ -29,9 +29,9 @@ async function setup(t, limits) {
   return { base, post };
 }
 
-async function events(base, token, t) {
+async function events(base, token, t, path = `/api/events?token=${token}`) {
   const controller = new AbortController();
-  const response = await fetch(`${base}/api/events?token=${token}`, {
+  const response = await fetch(base + path, {
     signal: controller.signal,
   });
   assert.equal(response.status, 200);
@@ -232,7 +232,10 @@ test("limits message flooding and retains only the latest 100 messages", async (
 test("throttles repeated session creation", async (t) => {
   const { post } = await setup(t);
   for (let i = 0; i < 30; i++)
-    assert.equal((await post("/api/session", { name: "Alex" })).status, 201);
+    assert.equal(
+      (await post("/api/session", { name: `Alex ${i}` })).status,
+      201,
+    );
   assert.equal((await post("/api/session", { name: "Alex" })).status, 429);
 });
 
@@ -522,11 +525,11 @@ test("rejects oversized chunked uploads and remains usable afterward", async (t)
 
 test("creates public/protected rooms and validates room entry grants", async (t) => {
   const { base, post } = await setup(t);
-  assert.equal((await fetch(base + "/api/rooms")).status, 401);
+  assert.equal((await fetch(base + "/api/rooms")).status, 200);
   assert.equal(
     (await post("/api/rooms", { name: "secret", password: "test-password" }))
       .status,
-    401,
+    400,
   );
   const alice = await post("/api/session", { name: "Alice" });
   const secret = await post(
@@ -535,7 +538,11 @@ test("creates public/protected rooms and validates room entry grants", async (t)
     alice.token,
   );
   assert.equal(secret.status, 201);
-  assert.deepEqual(secret.room, { name: "secret", protected: true });
+  assert.deepEqual(secret.room, {
+    id: secret.room.id,
+    name: "secret",
+    protected: true,
+  });
   assert.equal(secret.user.name, "Alice");
   assert.equal(
     (await post("/api/session", { name: "Bob", room: "secret" })).status,
@@ -569,7 +576,11 @@ test("creates public/protected rooms and validates room entry grants", async (t)
   );
   const open = await post("/api/rooms", { name: "open" }, alice.token);
   assert.equal(open.status, 201);
-  assert.deepEqual(open.room, { name: "open", protected: false });
+  assert.deepEqual(open.room, {
+    id: open.room.id,
+    name: "open",
+    protected: false,
+  });
   assert.equal(
     (await post("/api/session", { name: "Carol", room: "open" })).status,
     201,
@@ -591,9 +602,9 @@ test("creates public/protected rooms and validates room entry grants", async (t)
   });
   assert.deepEqual(await listing.json(), {
     rooms: [
-      { name: "general", protected: false },
-      { name: "secret", protected: true },
-      { name: "open", protected: false },
+      { id: alice.room.id, name: "general", protected: false, count: 0 },
+      { id: secret.room.id, name: "secret", protected: true, count: 0 },
+      { id: open.room.id, name: "open", protected: false, count: 0 },
     ],
   });
   const info = await fetch(base + "/api/session", {
@@ -772,5 +783,343 @@ test("throttles password guessing and room creation", async (t) => {
   assert.equal(
     (await post("/api/rooms", { name: "too-many" }, user.token)).status,
     429,
+  );
+});
+
+test("room listings are available before login, carry live counts, and deduplicate tabs", async (t) => {
+  const { base, post } = await setup(t);
+  const catalog = await events(base, null, t, "/api/rooms/events");
+  const initial = await catalog.next("rooms");
+  assert.equal(initial.rooms[0].name, "general");
+  assert.equal(initial.rooms[0].count, 0);
+  const created = await post("/api/rooms", {
+    name: "from-login",
+    nickname: "Alice",
+    password: "test-password",
+  });
+  assert.equal(created.status, 201);
+  const added = await catalog.next("rooms");
+  assert.equal(added.rooms.find((room) => room.name === "from-login").count, 0);
+  const first = await events(base, created.token, t);
+  await first.next("ready");
+  assert.equal(
+    (await catalog.next("rooms")).rooms.find(
+      (room) => room.name === "from-login",
+    ).count,
+    1,
+  );
+  const tab = await events(base, created.token, t);
+  await tab.next("ready");
+  assert.equal(
+    (await catalog.next("rooms")).rooms.find(
+      (room) => room.name === "from-login",
+    ).count,
+    1,
+  );
+  first.close();
+  assert.equal(
+    (await catalog.next("rooms")).rooms.find(
+      (room) => room.name === "from-login",
+    ).count,
+    1,
+  );
+  tab.close();
+  assert.equal(
+    (await catalog.next("rooms")).rooms.find(
+      (room) => room.name === "from-login",
+    ).count,
+    0,
+  );
+});
+
+test("empty rooms expire, revoke old tokens and files, and cannot be accessed after name reuse", async (t) => {
+  const { base, post } = await setup(t, undefined, { roomGraceMs: 90 });
+  const catalog = await events(base, null, t, "/api/rooms/events");
+  await catalog.next("rooms");
+  const created = await post("/api/rooms", {
+    name: "ephemeral",
+    nickname: "Alice",
+  });
+  const stream = await events(base, created.token, t);
+  await stream.next("ready");
+  const file = await upload(
+    base,
+    created.token,
+    "private.bin",
+    "private bytes",
+  );
+  assert.equal(
+    (
+      await post(
+        "/api/messages",
+        { attachmentId: file.attachment.id },
+        created.token,
+      )
+    ).status,
+    201,
+  );
+  stream.close();
+  let snapshot;
+  do {
+    snapshot = await catalog.next("rooms");
+  } while (snapshot.rooms.some((room) => room.name === "ephemeral"));
+  assert.deepEqual(
+    snapshot.rooms.map((room) => room.name),
+    ["general"],
+  );
+  assert.equal(
+    (
+      await fetch(base + "/api/session", {
+        headers: { Authorization: `Bearer ${created.token}` },
+      })
+    ).status,
+    401,
+  );
+  assert.equal(
+    (await post("/api/messages", { text: "cannot resurrect" }, created.token))
+      .status,
+    401,
+  );
+  const replacement = await post("/api/rooms", {
+    name: "ephemeral",
+    nickname: "Bob",
+  });
+  assert.notEqual(replacement.room.id, created.room.id);
+  assert.equal(
+    (await fetch(`${base}/api/events?token=${created.token}`)).status,
+    401,
+  );
+  assert.equal(
+    (
+      await post("/api/session", {
+        name: "Alice",
+        room: "ephemeral",
+        roomId: created.room.id,
+      })
+    ).status,
+    404,
+  );
+  assert.equal(
+    (
+      await fetch(
+        `${base}/api/files/${file.attachment.id}?token=${replacement.token}`,
+      )
+    ).status,
+    404,
+  );
+});
+
+test("a reconnect within the empty-room grace period preserves history", async (t) => {
+  const { base, post } = await setup(t, undefined, { roomGraceMs: 150 });
+  const created = await post("/api/rooms", {
+    name: "reconnect",
+    nickname: "Alice",
+  });
+  const first = await events(base, created.token, t);
+  await first.next("ready");
+  const message = await post(
+    "/api/messages",
+    { text: "Keep history" },
+    created.token,
+  );
+  first.close();
+  const second = await events(base, created.token, t);
+  assert.deepEqual((await second.next("ready")).messages, [message.message]);
+  // Crossing the deletion deadline must not delete an occupied room.
+  await new Promise((resolve) => setTimeout(resolve, 190));
+  const list = await (await fetch(base + "/api/rooms")).json();
+  assert.equal(list.rooms.find((room) => room.id === created.room.id).count, 1);
+});
+
+test("an in-flight upload cannot survive deletion or publish into a recreated room", async (t) => {
+  const { base, post } = await setup(
+    t,
+    { maxFileSize: 8, maxStorageSize: 8 },
+    { roomGraceMs: 100 },
+  );
+  const catalog = await events(base, null, t, "/api/rooms/events");
+  await catalog.next("rooms");
+  const created = await post("/api/rooms", {
+    name: "upload-race",
+    nickname: "Alice",
+  });
+  let request;
+  const completed = new Promise((resolve, reject) => {
+    request = http.request(
+      base + "/api/files",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${created.token}`,
+          "Content-Type": "application/octet-stream",
+          "X-File-Name": "slow.bin",
+          "Transfer-Encoding": "chunked",
+        },
+      },
+      (response) => {
+        response.resume();
+        response.on("end", () => resolve(response.statusCode));
+      },
+    );
+    request.on("error", reject);
+    request.write("1234");
+  });
+  let snapshot;
+  do {
+    snapshot = await catalog.next("rooms");
+  } while (snapshot.rooms.some((room) => room.id === created.room.id));
+  request.end("5678");
+  assert.equal(await completed, 401);
+  const replacement = await post("/api/rooms", {
+    name: "upload-race",
+    nickname: "Bob",
+  });
+  assert.equal(
+    (await upload(base, replacement.token, "new.bin", "12345678")).status,
+    201,
+    "failed upload must release its bytes and reservations",
+  );
+});
+
+test("reserves nicknames before room selection and rejects duplicates across entry APIs", async (t) => {
+  const { base, post } = await setup(t);
+  const alice = await post("/api/nickname", { name: "  Alice  " });
+  assert.equal(alice.status, 201);
+  assert.equal(alice.user.name, "Alice");
+  for (const name of ["Alice", "ALICE", "Ａｌｉｃｅ"]) {
+    const conflict = await post("/api/nickname", { name });
+    assert.equal(conflict.status, 409);
+    assert.equal(conflict.code, "NICKNAME_TAKEN");
+  }
+  assert.equal((await post("/api/session", { name: "Alice" })).status, 409);
+  assert.equal(
+    (await post("/api/rooms", { name: "claimed", nickname: "Alice" })).status,
+    409,
+  );
+  assert.equal(
+    (await (await fetch(base + "/api/rooms")).json()).rooms.some(
+      (room) => room.name === "claimed",
+    ),
+    false,
+  );
+  assert.equal(
+    (
+      await post(
+        "/api/messages",
+        { text: "cannot send from lobby" },
+        alice.identityToken,
+      )
+    ).status,
+    401,
+  );
+  assert.equal(
+    (await upload(base, alice.identityToken, "file", "data")).status,
+    401,
+  );
+  assert.equal(
+    (await fetch(`${base}/api/events?token=${alice.identityToken}`)).status,
+    401,
+  );
+  const joined = await post(
+    "/api/session",
+    { name: "Alice" },
+    alice.identityToken,
+  );
+  assert.equal(joined.status, 201);
+  assert.equal(joined.user.id, alice.user.id);
+  const privateRoom = await post(
+    "/api/rooms",
+    { name: "private", password: "test-password" },
+    alice.identityToken,
+  );
+  assert.equal(privateRoom.status, 201);
+  assert.equal(privateRoom.user.id, alice.user.id);
+  const aliceInOtherRoom = await post("/api/session", {
+    name: "Alice",
+    room: "private",
+    password: "test-password",
+  });
+  assert.equal(aliceInOtherRoom.status, 409);
+});
+
+test("nickname claims are atomic and owner-authorized renames release the old name", async (t) => {
+  const { base, post } = await setup(t);
+  const results = await Promise.all([
+    post("/api/nickname", { name: "Race" }),
+    post("/api/nickname", { name: "race" }),
+  ]);
+  assert.deepEqual(results.map((result) => result.status).sort(), [201, 409]);
+  const owner = results.find((result) => result.status === 201);
+  const bob = await post("/api/session", { name: "Bob" });
+  assert.equal(
+    (await post("/api/nickname", { name: "Bob" }, owner.identityToken)).status,
+    409,
+  );
+  assert.equal(
+    (await post("/api/session", { name: "Bob" }, owner.identityToken)).status,
+    409,
+  );
+  const joined = await post(
+    "/api/session",
+    { name: owner.user.name },
+    owner.identityToken,
+  );
+  const a = await events(base, joined.token, t);
+  await a.next("ready");
+  const renamed = await post(
+    "/api/session",
+    { name: "New name" },
+    joined.token,
+  );
+  assert.equal(renamed.status, 201);
+  assert.equal(renamed.user.id, owner.user.id);
+  assert.deepEqual(await a.next("profile"), renamed.user);
+  const second = await events(base, renamed.token, t);
+  assert.equal(
+    (await second.next("ready")).users.length,
+    1,
+    "the same owner does not appear twice while replacing a room grant",
+  );
+  assert.equal(
+    (await post("/api/nickname", { name: owner.user.name })).status,
+    201,
+  );
+  assert.equal(
+    (
+      await fetch(base + "/api/nickname", {
+        headers: { Authorization: `Bearer ${bob.identityToken}` },
+      })
+    ).status,
+    200,
+  );
+});
+
+test("unused nickname reservations expire without granting ownership to old credentials", async (t) => {
+  const { base, post } = await setup(t, undefined, { nicknameGraceMs: 50 });
+  const first = await post("/api/nickname", { name: "Temporary" });
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  const replacement = await post("/api/nickname", { name: "temporary" });
+  assert.equal(replacement.status, 201);
+  assert.notEqual(replacement.user.id, first.user.id);
+  assert.equal(
+    (
+      await fetch(base + "/api/nickname", {
+        headers: { Authorization: `Bearer ${first.identityToken}` },
+      })
+    ).status,
+    401,
+  );
+});
+
+test("a connected participant keeps their nickname even before the next heartbeat", async (t) => {
+  const { base, post } = await setup(t, undefined, { nicknameGraceMs: 50 });
+  const alice = await post("/api/session", { name: "Alice" });
+  const connection = await events(base, alice.token, t);
+  await connection.next("ready");
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal((await post("/api/nickname", { name: "alice" })).status, 409);
+  assert.equal(
+    (await post("/api/messages", { text: "Still here" }, alice.token)).status,
+    201,
   );
 });

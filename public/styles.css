@@ -523,36 +523,9 @@ dialog button {
 .statusbar h1 {
   min-width: 0;
 }
-#room-list {
-  list-style: none;
-  padding: 0;
-  margin: 0 0 20px;
-  max-height: 180px;
-  overflow-y: auto;
-  scrollbar-width: thin;
-}
-#room-list button {
-  text-align: left;
-  overflow-wrap: anywhere;
-}
-#rooms-dialog .login-line {
-  margin-bottom: 16px;
-}
-#rooms-dialog .room-help {
-  font-size: 10px;
-  margin: 0;
-}
 .room-actions {
   display: flex;
   gap: 20px;
-}
-#room-close {
-  margin-left: auto;
-  color: var(--muted);
-}
-#join-general {
-  margin-left: 16px;
-  color: var(--muted);
 }
 #join-password-field {
   margin-top: 16px;
@@ -576,4 +549,97 @@ dialog button {
   .connection {
     margin-left: auto;
   }
+}
+
+#settings-button {
+  flex-shrink: 0;
+  color: var(--green);
+}
+.room-list {
+  list-style: none;
+  padding: 0;
+  margin: 12px 0 20px;
+  max-height: 180px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+.room-list button {
+  text-align: left;
+  overflow-wrap: anywhere;
+  width: 100%;
+  padding: 6px 8px;
+  border-left: 2px solid transparent;
+}
+.room-list button[aria-pressed="true"] {
+  border-left-color: var(--green);
+  background: #202b20;
+}
+#join-panel .login-line,
+#create-dialog .login-line {
+  margin-bottom: 16px;
+}
+.room-help {
+  font-size: 10px;
+  margin: 0;
+}
+#entry-close,
+#create-back {
+  margin-left: auto;
+  color: var(--muted);
+}
+#settings-dialog select {
+  width: 100%;
+  margin: 0 0 22px;
+  border: 1px solid var(--line);
+  background: var(--background);
+  color: var(--green);
+  padding: 9px;
+  font: inherit;
+  border-radius: 0;
+}
+#settings-dialog input[type="range"] {
+  width: 100%;
+  accent-color: var(--green);
+  padding: 10px 0;
+  margin-bottom: 20px;
+  cursor: pointer;
+}
+#settings-dialog input:focus-visible,
+#settings-dialog select:focus-visible {
+  outline: 1px solid var(--green);
+}
+#settings-close {
+  margin-left: auto;
+  color: var(--muted);
+}
+#volume-value {
+  color: var(--green);
+}
+@media (max-width: 640px) {
+  #settings-button {
+    font-size: 11px;
+  }
+  .room-actions {
+    flex-wrap: wrap;
+    gap: 14px;
+  }
+}
+
+@media (max-width: 640px) {
+  .statusbar h1 {
+    flex: 1 0 100%;
+  }
+  #rooms-button {
+    margin-left: 0;
+  }
+}
+
+#nickname-next {
+  margin-top: 8px;
+}
+#entry-back {
+  color: var(--muted);
+}
+#room-step > .room-help {
+  margin-bottom: 12px;
 }

@@ -35,6 +35,11 @@ export class AttachmentStore {
     }
   }
 
+  removeRoom(roomName) {
+    for (const file of this.files.values())
+      if (file.roomName === roomName) this.remove(file.id);
+  }
+
   prune(now = Date.now()) {
     for (const file of this.files.values()) {
       if (!file.attached && now - file.created > PENDING_TTL)

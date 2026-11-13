@@ -1,13 +1,19 @@
-import { randomBytes, scrypt, timingSafeEqual } from "node:crypto";
+import { randomBytes, randomUUID, scrypt, timingSafeEqual } from "node:crypto";
 import { promisify } from "node:util";
 
 const deriveKey = promisify(scrypt);
 const fail = (message, status) => Object.assign(new Error(message), { status });
-export const roomInfo = (room) => ({ name: room.name, protected: !!room.hash });
+export const roomInfo = (room) => ({
+  id: room.id,
+  name: room.name,
+  protected: !!room.hash,
+});
 
 export class RoomStore {
   constructor() {
-    this.rooms = new Map([["general", { name: "general", messages: [] }]]);
+    this.rooms = new Map([
+      ["general", { id: randomUUID(), name: "general", messages: [] }],
+    ]);
     this.pending = new Set();
     this.hashing = 0;
   }
@@ -47,14 +53,14 @@ export class RoomStore {
       throw fail("That room already exists. Join it instead.", 409);
     if (this.rooms.size + this.pending.size >= 50)
       throw fail(
-        "Room limit reached (50). Restart the server to clear rooms.",
+        "Room limit reached (50). Wait for empty rooms to close.",
         409,
       );
     this.pending.add(name);
     try {
       const salt = password ? randomBytes(16) : null;
       const hash = password ? await this.hash(password, salt) : null;
-      const room = { name, salt, hash, messages: [] };
+      const room = { id: randomUUID(), name, salt, hash, messages: [] };
       this.rooms.set(name, room);
       return room;
     } finally {

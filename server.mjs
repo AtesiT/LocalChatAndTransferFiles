@@ -13,55 +13,177 @@ const SESSION_TTL = 24 * 60 * 60 * 1000;
 const files = new Map([
   ["/", ["index.html", "text/html; charset=utf-8"]],
   ["/app.js", ["app.js", "text/javascript; charset=utf-8"]],
+  ["/notifications.js", ["notifications.js", "text/javascript; charset=utf-8"]],
   ["/styles.css", ["styles.css", "text/css; charset=utf-8"]],
 ]);
 
-export function createChatServer(fileLimits = {}) {
+export function createChatServer(
+  fileLimits = {},
+  { roomGraceMs = 15000, nicknameGraceMs = 120000 } = {},
+) {
   const attachments = new AttachmentStore(fileLimits);
   const sessions = new Map();
+  const identities = new Map();
+  const nicknameAttempts = new Map();
   const clients = new Set();
   const rooms = new RoomStore();
   const roomAttempts = new Map();
   const roomCreations = new Map();
   const joins = new Map();
+  const roomWatchers = new Set();
+  const emptyTimers = new Map();
+  let stopping = false;
   const send = (response, event, data) => {
-    if (!response.destroyed)
+    if (!response.destroyed && !response.writableEnded)
       response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   };
-  const online = (roomName) =>
-    [...sessions.values()]
-      .filter(
-        (session) => session.connections > 0 && session.roomName === roomName,
-      )
-      .map(({ id, name }) => ({ id, name }));
+  const online = (roomName) => [
+    ...new Map(
+      [...sessions.values()]
+        .filter(
+          (session) => session.connections > 0 && session.roomName === roomName,
+        )
+        .map((session) => [
+          session.identity.id,
+          { id: session.identity.id, name: session.identity.name },
+        ]),
+    ).values(),
+  ];
   const broadcast = (roomName, event, data) => {
     for (const client of clients)
       if (client.session.roomName === roomName)
         send(client.response, event, data);
   };
-  const issueSession = (name, roomName) => {
+  const roomList = () =>
+    rooms.list().map((room) => ({ ...room, count: online(room.name).length }));
+  const publishRooms = () => {
+    const snapshot = { rooms: roomList() };
+    for (const response of roomWatchers) send(response, "rooms", snapshot);
+  };
+  const scheduleEmpty = (room) => {
+    clearTimeout(emptyTimers.get(room.name));
+    emptyTimers.delete(room.name);
+    if (stopping || room.name === "general" || online(room.name).length) return;
+    const timer = setTimeout(() => {
+      emptyTimers.delete(room.name);
+      if (rooms.get(room.name) !== room || online(room.name).length) return;
+      rooms.rooms.delete(room.name);
+      attachments.removeRoom(room.name);
+      for (const [token, session] of sessions)
+        if (session.room === room && session.roomName !== null)
+          sessions.delete(token);
+      publishRooms();
+    }, roomGraceMs);
+    timer.unref();
+    emptyTimers.set(room.name, timer);
+  };
+  const validateNickname = (value) => {
+    const name =
+      typeof value === "string" ? value.trim().replace(/\s+/g, " ") : "";
+    if (!name || [...name].length > 24 || /[\p{Cc}\p{Cf}]/u.test(name))
+      throw Object.assign(
+        new Error("Choose a name between 1 and 24 characters."),
+        { status: 400 },
+      );
+    return name;
+  };
+  const identityOnline = (identity) =>
+    [...clients].some(
+      (client) =>
+        client.session.identity === identity && !client.response.destroyed,
+    );
+  const nicknameKey = (name) => name.normalize("NFKC").toLowerCase();
+  const expireIdentity = (identity) => {
+    if (identities.get(identity.key) === identity)
+      identities.delete(identity.key);
+    for (const [token, session] of sessions)
+      if (session.identity === identity) sessions.delete(token);
+  };
+  const resolveIdentity = (name, existing) => {
+    const key = nicknameKey(name);
+    const occupied = identities.get(key);
+    if (occupied && Date.now() > occupied.expires && !identityOnline(occupied))
+      expireIdentity(occupied);
+    if (identities.has(key) && identities.get(key) !== existing?.identity)
+      throw Object.assign(
+        new Error("That nickname is already in use. Choose another."),
+        { status: 409, code: "NICKNAME_TAKEN" },
+      );
+    let identity = existing?.identity;
+    if (!identity) {
+      identity = {
+        id: randomUUID(),
+        name,
+        key,
+        expires: Date.now() + nicknameGraceMs,
+        token: randomBytes(32).toString("hex"),
+      };
+      sessions.set(identity.token, {
+        id: randomUUID(),
+        identity,
+        name,
+        room: null,
+        roomName: null,
+        connections: 0,
+        touched: Date.now(),
+        sent: [],
+      });
+    } else if (identity.name !== name) {
+      if (identities.get(identity.key) === identity)
+        identities.delete(identity.key);
+      identity.name = name;
+      identity.key = key;
+      for (const session of sessions.values())
+        if (session.identity === identity) session.name = name;
+      for (const client of clients)
+        if (client.session.identity === identity)
+          send(client.response, "profile", { id: identity.id, name });
+      for (const room of rooms.rooms.values())
+        broadcast(room.name, "presence", online(room.name));
+    }
+    identities.set(key, identity);
+    identity.expires = Date.now() + nicknameGraceMs;
+    return identity;
+  };
+  const issueSession = (name, roomName, existing) => {
+    const identity = resolveIdentity(name, existing);
     const token = randomBytes(32).toString("hex");
     const session = {
       id: randomUUID(),
-      name,
+      identity,
+      name: identity.name,
       roomName,
+      room: rooms.get(roomName),
       connections: 0,
       touched: Date.now(),
       sent: [],
     };
     sessions.set(token, session);
+    scheduleEmpty(session.room);
     return {
       token,
-      user: { id: session.id, name },
-      room: roomInfo(rooms.get(roomName)),
+      identityToken: identity.token,
+      user: { id: identity.id, name: identity.name },
+      room: roomInfo(session.room),
     };
   };
-  const authenticate = (request, token) => {
+  const authenticate = (request, token, roomRequired = true) => {
     token ||= request.headers.authorization?.replace(/^Bearer /, "");
     const session = sessions.get(token);
-    return session && Date.now() - session.touched <= SESSION_TTL
-      ? session
-      : null;
+    if (
+      !session ||
+      (session.identity.expires < Date.now() &&
+        !identityOnline(session.identity)) ||
+      identities.get(session.identity.key) !== session.identity
+    )
+      return null;
+    if (roomRequired && !session.room) return null;
+    if (session.room && rooms.get(session.roomName) !== session.room)
+      return null;
+    if (session.room && Date.now() - session.touched > SESSION_TTL) return null;
+    session.identity.expires = Date.now() + nicknameGraceMs;
+    session.touched = Date.now();
+    return session;
   };
   const throttle = (map, address, limit) => {
     const attempts = (map.get(address) || []).filter(
@@ -127,8 +249,8 @@ export function createChatServer(fileLimits = {}) {
         }
         if (url.pathname === "/api/files") {
           const token = request.headers.authorization?.replace(/^Bearer /, "");
-          const session = sessions.get(token);
-          if (!session || Date.now() - session.touched > SESSION_TTL)
+          const session = authenticate(request, token);
+          if (!session)
             return json(response, 401, {
               error: "Please join the chat again.",
             });
@@ -150,20 +272,44 @@ export function createChatServer(fileLimits = {}) {
             session.id,
             session.roomName,
           );
+          if (authenticate(request) !== session) {
+            attachments.remove(attachment.id);
+            return json(response, 401, {
+              error: "Room expired. Please join again.",
+            });
+          }
           return json(response, 201, { attachment });
         }
         if (!request.headers["content-type"]?.startsWith("application/json"))
           return json(response, 415, { error: "Use application/json." });
+        if (url.pathname === "/api/nickname") {
+          throttle(nicknameAttempts, request.socket.remoteAddress, 30);
+          const input = await body(request);
+          const name = validateNickname(input?.name);
+          const identity = resolveIdentity(
+            name,
+            authenticate(request, undefined, false),
+          );
+          return json(response, 201, {
+            identityToken: identity.token,
+            user: { id: identity.id, name: identity.name },
+          });
+        }
         if (url.pathname === "/api/rooms") {
-          const session = authenticate(request);
-          if (!session)
-            return json(response, 401, {
-              error: "Please join the chat again.",
-            });
           throttle(roomCreations, request.socket.remoteAddress, 5);
           const input = await body(request);
+          const session = authenticate(request, undefined, false);
+          const name = session?.name || validateNickname(input?.nickname);
           const room = await rooms.create(input?.name, input?.password);
-          return json(response, 201, issueSession(session.name, room.name));
+          let result;
+          try {
+            result = issueSession(name, room.name, session);
+          } catch (error) {
+            rooms.rooms.delete(room.name);
+            throw error;
+          }
+          publishRooms();
+          return json(response, 201, result);
         }
         if (url.pathname === "/api/session") {
           const address = request.socket.remoteAddress;
@@ -177,14 +323,7 @@ export function createChatServer(fileLimits = {}) {
           attempts.push(Date.now());
           joins.set(address, attempts);
           const input = await body(request);
-          const name =
-            typeof input?.name === "string"
-              ? input.name.trim().replace(/\s+/g, " ")
-              : "";
-          if (!name || [...name].length > 24 || /[\p{Cc}\p{Cf}]/u.test(name))
-            return json(response, 400, {
-              error: "Choose a name between 1 and 24 characters.",
-            });
+          const name = validateNickname(input?.name);
           const roomName = input?.room ?? "general";
           rooms.validateName(roomName);
           const room = rooms.get(roomName);
@@ -192,23 +331,35 @@ export function createChatServer(fileLimits = {}) {
             return json(response, 404, {
               error: "Room not found. Create it or use #general.",
             });
-          const existing = authenticate(request);
+          if (input?.roomId !== undefined && input.roomId !== room.id)
+            return json(response, 404, {
+              error: "That room closed. Choose it again from the list.",
+            });
+          const existing = authenticate(request, undefined, false);
           // Renaming within the same room may reuse its existing session grant.
           if (room.hash && existing?.roomName !== roomName) {
             throttle(roomAttempts, request.socket.remoteAddress, 10);
             if (!(await rooms.verify(room, input?.password)))
               return json(response, 403, { error: "Incorrect room password." });
           }
-          return json(response, 201, issueSession(name, roomName));
+          if (rooms.get(roomName) !== room)
+            return json(response, 404, {
+              error: "Room expired. Choose another room.",
+            });
+          return json(response, 201, issueSession(name, roomName, existing));
         }
         if (url.pathname === "/api/messages") {
           const token = request.headers.authorization?.replace(/^Bearer /, "");
-          const session = sessions.get(token);
-          if (!session || Date.now() - session.touched > SESSION_TTL)
+          const session = authenticate(request, token);
+          if (!session)
             return json(response, 401, {
               error: "Please join the chat again.",
             });
           const input = await body(request);
+          if (authenticate(request) !== session)
+            return json(response, 401, {
+              error: "Room expired. Please join again.",
+            });
           const text = typeof input?.text === "string" ? input.text.trim() : "";
           const attachmentId = input?.attachmentId;
           if (attachmentId !== undefined && typeof attachmentId !== "string")
@@ -241,7 +392,7 @@ export function createChatServer(fileLimits = {}) {
           session.touched = Date.now();
           const message = {
             id: randomUUID(),
-            userId: session.id,
+            userId: session.identity.id,
             name: session.name,
             text,
             time: new Date().toISOString(),
@@ -267,8 +418,8 @@ export function createChatServer(fileLimits = {}) {
         const token =
           request.headers.authorization?.replace(/^Bearer /, "") ||
           url.searchParams.get("token");
-        const session = sessions.get(token);
-        if (!session || Date.now() - session.touched > SESSION_TTL)
+        const session = authenticate(request, token);
+        if (!session)
           return json(response, 401, { error: "Please join the chat again." });
         const file = attachments.get(url.pathname.slice("/api/files/".length));
         // Pending uploads stay private, even to other logged-in participants.
@@ -283,26 +434,47 @@ export function createChatServer(fileLimits = {}) {
         });
         return response.end(request.method === "HEAD" ? undefined : file.data);
       }
+      if (request.method === "GET" && url.pathname === "/api/rooms/events") {
+        response.writeHead(200, {
+          "Content-Type": "text/event-stream",
+          Connection: "keep-alive",
+          "X-Accel-Buffering": "no",
+        });
+        response.write("retry: 2000\n\n");
+        roomWatchers.add(response);
+        send(response, "rooms", { rooms: roomList() });
+        response.on("close", () => roomWatchers.delete(response));
+        return;
+      }
       if (request.method === "GET" && url.pathname === "/api/rooms") {
-        if (!authenticate(request))
-          return json(response, 401, { error: "Please join the chat again." });
-        return json(response, 200, { rooms: rooms.list() });
+        return json(response, 200, { rooms: roomList() });
+      }
+      if (request.method === "GET" && url.pathname === "/api/nickname") {
+        const session = authenticate(request, undefined, false);
+        if (!session)
+          return json(response, 401, { error: "Choose your nickname again." });
+        return json(response, 200, {
+          identityToken: session.identity.token,
+          user: { id: session.identity.id, name: session.identity.name },
+        });
       }
       if (request.method === "GET" && url.pathname === "/api/session") {
         const token = request.headers.authorization?.replace(/^Bearer /, "");
-        const session = sessions.get(token);
-        if (!session || Date.now() - session.touched > SESSION_TTL)
+        const session = authenticate(request, token);
+        if (!session)
           return json(response, 401, { error: "Please join the chat again." });
         return json(response, 200, {
-          user: { id: session.id, name: session.name },
+          user: { id: session.identity.id, name: session.identity.name },
           room: roomInfo(rooms.get(session.roomName)),
         });
       }
       if (request.method === "GET" && url.pathname === "/api/events") {
-        const session = sessions.get(url.searchParams.get("token"));
-        if (!session || Date.now() - session.touched > SESSION_TTL)
+        const session = authenticate(request, url.searchParams.get("token"));
+        if (!session)
           return json(response, 401, { error: "Please join the chat again." });
         session.connections++;
+        clearTimeout(emptyTimers.get(session.roomName));
+        emptyTimers.delete(session.roomName);
         session.touched = Date.now();
         response.writeHead(200, {
           "Content-Type": "text/event-stream",
@@ -313,18 +485,22 @@ export function createChatServer(fileLimits = {}) {
         const client = { response, session };
         clients.add(client);
         send(response, "ready", {
-          user: { id: session.id, name: session.name },
+          user: { id: session.identity.id, name: session.identity.name },
           messages: rooms.get(session.roomName).messages,
           room: roomInfo(rooms.get(session.roomName)),
           users: online(session.roomName),
           fileLimits: attachments.limits,
         });
         broadcast(session.roomName, "presence", online(session.roomName));
+        publishRooms();
         response.on("close", () => {
           clients.delete(client);
           session.connections--;
           session.touched = Date.now();
+          session.identity.expires = Date.now() + nicknameGraceMs;
           broadcast(session.roomName, "presence", online(session.roomName));
+          publishRooms();
+          scheduleEmpty(session.room);
         });
         return;
       }
@@ -353,19 +529,29 @@ export function createChatServer(fileLimits = {}) {
           error: error.status
             ? error.message
             : "Something went wrong. Please try again.",
+          ...(error.code === "NICKNAME_TAKEN" ? { code: error.code } : {}),
         });
     }
   });
   const heartbeat = setInterval(() => {
     attachments.prune();
+    for (const response of roomWatchers) response.write(": heartbeat\n\n");
     for (const { response, session } of clients) {
       session.touched = Date.now();
+      session.identity.expires = Date.now() + nicknameGraceMs;
       response.write(": heartbeat\n\n");
     }
     for (const [token, session] of sessions)
-      if (!session.connections && Date.now() - session.touched > SESSION_TTL)
+      if (
+        session.room &&
+        !session.connections &&
+        Date.now() - session.touched > SESSION_TTL
+      )
         sessions.delete(token);
-    for (const map of [joins, roomAttempts, roomCreations]) {
+    for (const identity of identities.values())
+      if (Date.now() > identity.expires && !identityOnline(identity))
+        expireIdentity(identity);
+    for (const map of [joins, roomAttempts, roomCreations, nicknameAttempts]) {
       for (const [address, times] of map)
         if (Date.now() - times.at(-1) > 60000) map.delete(address);
     }
@@ -373,9 +559,13 @@ export function createChatServer(fileLimits = {}) {
   heartbeat.unref();
   server.on("close", () => {
     clearInterval(heartbeat);
+    for (const timer of emptyTimers.values()) clearTimeout(timer);
     attachments.clear();
   });
   server.stop = () => {
+    stopping = true;
+    for (const timer of emptyTimers.values()) clearTimeout(timer);
+    for (const response of roomWatchers) response.end();
     for (const { response } of clients) response.end();
     server.close();
     server.closeIdleConnections();
