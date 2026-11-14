@@ -1,3 +1,4 @@
+import { messageMatches, messagePreview } from "/chat-text.js";
 import { TabUnread } from "/unread.js";
 import { UploadQueue, requestId } from "/uploads.js";
 import { NotificationAudio, SOUNDS } from "/notifications.js";
@@ -19,6 +20,9 @@ const unread = new TabUnread((title) => {
 });
 let noticeTimer;
 let seen = new Set();
+const roomMessages = new Map();
+let replyTarget = null;
+let dragDepth = 0;
 const audio = new NotificationAudio();
 let roomCatalog = null;
 let catalogStream = null;
@@ -156,8 +160,94 @@ function updateComposer() {
   $("#character-count").textContent =
     length > 1600 ? `${length.toLocaleString()} / 2,000` : "";
   $("#character-count").classList.toggle("over", length > 2000);
+  $("#search-button").disabled = !connected || loggingOut;
+  updateReply();
   input.style.height = "auto";
   input.style.height = `${Math.min(input.scrollHeight, 150)}px`;
+}
+function updateReply() {
+  $("#reply-draft").hidden = !replyTarget;
+  $("#reply-preview").textContent = replyTarget
+    ? `reply to <${replyTarget.name}>: ${replyTarget.preview}`
+    : "";
+  $("#reply-cancel").disabled = sending || loggingOut;
+}
+function chooseReply(message) {
+  if (!connected || sending || loggingOut || roomBusy) return;
+  replyTarget = {
+    id: message.id,
+    name: message.name,
+    preview: messagePreview(message),
+  };
+  updateReply();
+  input.focus();
+}
+function mention(name) {
+  if (!connected || sending || loggingOut || roomBusy) return;
+  const start = input.selectionStart;
+  const prefix = start && !/\s/u.test(input.value[start - 1]) ? " " : "";
+  const value = `${prefix}@${name} `;
+  if (
+    input.value.length - (input.selectionEnd - start) + value.length >
+    input.maxLength
+  )
+    return;
+  input.setRangeText(value, start, input.selectionEnd, "end");
+  input.focus();
+  updateComposer();
+}
+function updateSearch() {
+  const query = $("#search-input").value;
+  let matches = 0;
+  for (const article of messages.querySelectorAll(".message")) {
+    const found = messageMatches(roomMessages.get(article.dataset.id), query);
+    article.hidden = !found;
+    if (found) matches++;
+  }
+  $("#search-count").textContent = query.trim()
+    ? `${matches}/${roomMessages.size} messages`
+    : `${roomMessages.size} messages (latest 100)`;
+}
+function closeSearch() {
+  $("#search-bar").hidden = true;
+  $("#search-input").value = "";
+  updateSearch();
+}
+function jumpToMessage(id) {
+  const article = [...messages.querySelectorAll(".message")].find(
+    (node) => node.dataset.id === id,
+  );
+  if (!article) {
+    notice("Original message is no longer in the retained history.");
+    return;
+  }
+  closeSearch();
+  article.scrollIntoView({ block: "center" });
+  article.classList.add("reply-highlight");
+  setTimeout(() => article.classList.remove("reply-highlight"), 1800);
+}
+function appendMessageText(container, message) {
+  let offset = 0;
+  for (const span of message.mentions || []) {
+    // Treat all content as text; even nicknames and filenames may contain HTML.
+    if (
+      !Number.isInteger(span.start) ||
+      !Number.isInteger(span.end) ||
+      span.start < offset ||
+      span.end > message.text.length ||
+      span.end <= span.start
+    )
+      continue;
+    container.append(
+      document.createTextNode(message.text.slice(offset, span.start)),
+    );
+    const mark = document.createElement("mark");
+    mark.className = `mention${span.id === user?.id ? " mention-self" : ""}`;
+    mark.textContent = message.text.slice(span.start, span.end);
+    container.append(mark);
+    offset = span.end;
+  }
+  container.append(document.createTextNode(message.text.slice(offset)));
 }
 function renderPeople(users) {
   $("#people-count").textContent = users.length;
@@ -167,9 +257,12 @@ function renderPeople(users) {
   for (const person of users) {
     const li = document.createElement("li");
     li.classList.toggle("self", person.id === user?.id);
-    const name = document.createElement("span");
+    const name = document.createElement("button");
+    name.type = "button";
     name.className = "person-name";
     name.textContent = person.name;
+    name.title = `Mention @${person.name}`;
+    name.addEventListener("click", () => mention(person.name));
     const status = document.createElement("span");
     status.className = "you";
     if (person.id === user?.id) status.textContent = "(you)";
@@ -187,7 +280,12 @@ function renderMessage(message, history = false) {
   const own = message.userId === user?.id;
   const article = document.createElement("article");
   article.className = `message${own ? " own" : ""}`;
-  const name = document.createElement("strong");
+  article.dataset.id = message.id;
+  roomMessages.set(message.id, message);
+  const name = document.createElement("button");
+  name.type = "button";
+  name.title = `Mention @${message.name}`;
+  name.addEventListener("click", () => mention(message.name));
   name.className = "message-name";
   name.textContent = message.name;
   const time = document.createElement("time");
@@ -202,7 +300,16 @@ function renderMessage(message, history = false) {
   time.title = date.toLocaleString("en");
   const text = document.createElement("div");
   text.className = "message-text";
-  text.textContent = message.text;
+  if (message.replyTo) {
+    const quote = document.createElement("button");
+    quote.type = "button";
+    quote.className = "reply-quote";
+    quote.textContent = `↪ <${message.replyTo.name}> ${message.replyTo.preview}`;
+    quote.title = "Jump to original message";
+    quote.addEventListener("click", () => jumpToMessage(message.replyTo.id));
+    text.append(quote);
+  }
+  appendMessageText(text, message);
   for (const attachment of message.attachments ||
     (message.attachment ? [message.attachment] : [])) {
     const link = document.createElement("a");
@@ -212,13 +319,25 @@ function renderMessage(message, history = false) {
     link.textContent = `[file] ${attachment.name} (${formatSize(attachment.size)}) ↓`;
     text.append(link);
   }
-  article.append(time, name, text);
+  const reply = document.createElement("button");
+  reply.type = "button";
+  reply.className = "reply-action";
+  reply.textContent = "[reply]";
+  reply.setAttribute(
+    "aria-label",
+    `Reply to ${message.name}: ${messagePreview(message)}`,
+  );
+  reply.addEventListener("click", () => chooseReply(message));
+  article.append(time, name, text, reply);
   messages.append(article);
   // Bound both the DOM and deduplication state during long conversations.
   if (seen.size > 100) {
-    seen.delete(seen.values().next().value);
+    const oldest = seen.values().next().value;
+    seen.delete(oldest);
+    roomMessages.delete(oldest);
     messages.querySelector(".message")?.remove();
   }
+  updateSearch();
   if (!history && shouldScroll) scrollBottom();
   else if (!history) $("#new-messages").hidden = false;
 }
@@ -258,17 +377,26 @@ async function api(path, data, auth = false) {
 function setRoom(room) {
   if (currentRoom.id !== room.id) {
     unread.reset(room.name);
+    closeSearch();
+    resetDrag();
     // A private-room draft must never silently become a public-room message.
-    drafts.set(currentRoom.id, { text: input.value, queue, pendingMessage });
+    drafts.set(currentRoom.id, {
+      text: input.value,
+      queue,
+      pendingMessage,
+      replyTarget,
+    });
     const draft = drafts.get(room.id);
     input.value = draft?.text || "";
     queue = draft?.queue || makeQueue();
     queue.limit = maxFilesPerMessage;
     pendingMessage = draft?.pendingMessage || null;
+    replyTarget = draft?.replyTarget || null;
     fileInput.value = "";
     updateFile();
     messages.querySelectorAll(".message").forEach((node) => node.remove());
     seen = new Set();
+    roomMessages.clear();
     $("#empty-state").hidden = false;
     $("#new-messages").hidden = true;
     renderPeople([]);
@@ -313,13 +441,14 @@ function connect() {
     queue.limit = maxFilesPerMessage;
     updateFile();
     $("#attach-button").title =
-      `Attach up to ${maxFilesPerMessage} files (max ${formatSize(maxFileSize)} each)`;
+      `Attach/drop up to ${maxFilesPerMessage} files or paste an image (max ${formatSize(maxFileSize)} each)`;
     $("#my-name").textContent = user.name;
     storage.set("commonroom-name", user.name);
     const wasNearBottom = nearBottom();
     const previousScroll = messages.scrollTop;
     messages.querySelectorAll(".message").forEach((node) => node.remove());
     seen = new Set();
+    roomMessages.clear();
     $("#empty-state").hidden = data.messages.length > 0;
     unread.snapshot(data.messages, user.id, tabActive());
     for (const message of data.messages) renderMessage(message, true);
@@ -328,7 +457,7 @@ function connect() {
     if (wasNearBottom) scrollBottom();
     else messages.scrollTop = previousScroll;
     if (dialog.open) dialog.close();
-    input.focus();
+    ($("#search-bar").hidden ? input : $("#search-input")).focus();
   });
   stream.addEventListener("message", (event) => {
     if (stream === source) renderMessage(JSON.parse(event.data));
@@ -513,6 +642,10 @@ function resetLogin() {
   fileInput.value = "";
   queue = makeQueue();
   pendingMessage = null;
+  replyTarget = null;
+  roomMessages.clear();
+  closeSearch();
+  resetDrag();
   currentRoom = { name: "general", protected: false };
   unread.reset("general");
   setRoom(currentRoom);
@@ -799,6 +932,7 @@ $("#message-form").addEventListener("submit", async (event) => {
   if ($("#send-button").disabled) return;
   const draft = input.value;
   const text = draft.trim();
+  const replyToId = replyTarget?.id || null;
   const sendingEpoch = authEpoch;
   const sendingQueue = queue;
   const sendingRoom = currentRoom.id;
@@ -817,7 +951,7 @@ $("#message-form").addEventListener("submit", async (event) => {
         "Room session changed. Your original-room draft has been kept; send it again there.",
       );
     if (!text && !attachmentIds.length) return;
-    const signature = JSON.stringify({ text, attachmentIds });
+    const signature = JSON.stringify({ text, attachmentIds, replyToId });
     if (pendingMessage?.signature !== signature)
       pendingMessage = { signature, clientMessageId: requestId() };
     // Publishing is atomic. Cancellation is only offered before the commit request.
@@ -825,12 +959,19 @@ $("#message-form").addEventListener("submit", async (event) => {
     updateFile();
     const result = await api(
       "/api/messages",
-      { text, attachmentIds, clientMessageId: pendingMessage.clientMessageId },
+      {
+        text,
+        attachmentIds,
+        replyToId,
+        clientMessageId: pendingMessage.clientMessageId,
+      },
       true,
     );
     sendingQueue.entries = [];
     if (currentRoom.id !== sendingRoom || queue !== sendingQueue) return;
     pendingMessage = null;
+    replyTarget = null;
+    updateReply();
     clearFile();
     clearTimeout(noticeTimer);
     $("#notice").hidden = true;
@@ -863,8 +1004,18 @@ $("#message-form").addEventListener("submit", async (event) => {
   }
 });
 $("#attach-button").addEventListener("click", () => fileInput.click());
-fileInput.addEventListener("change", () => {
-  for (const file of fileInput.files) {
+function addFiles(files) {
+  if (
+    !connected ||
+    sending ||
+    loggingOut ||
+    roomBusy ||
+    document.querySelector("dialog[open]")
+  ) {
+    notice("Join a room and finish the current send before attaching files.");
+    return;
+  }
+  for (const file of files) {
     if (file.size > maxFileSize) {
       notice(`File is too large. Maximum size: ${formatSize(maxFileSize)}.`);
       continue;
@@ -880,10 +1031,165 @@ fileInput.addEventListener("change", () => {
       break;
     }
   }
-  fileInput.value = "";
   updateFile();
   updateComposer();
   input.focus();
+}
+fileInput.addEventListener("change", () => {
+  addFiles(fileInput.files);
+  fileInput.value = "";
+});
+const fileDrag = (event) =>
+  Array.from(event.dataTransfer?.types || []).includes("Files");
+function resetDrag() {
+  dragDepth = 0;
+  $("#drop-hint").hidden = true;
+  $(".terminal").classList.remove("drag-active");
+}
+document.addEventListener("dragenter", (event) => {
+  if (!fileDrag(event)) return;
+  event.preventDefault();
+  dragDepth++;
+  if (
+    connected &&
+    !sending &&
+    !loggingOut &&
+    !roomBusy &&
+    !document.querySelector("dialog[open]")
+  ) {
+    $("#drop-hint").hidden = false;
+    $(".terminal").classList.add("drag-active");
+  }
+});
+document.addEventListener("dragover", (event) => {
+  if (!fileDrag(event)) return;
+  event.preventDefault(); // Never navigate away from chat when a file is dropped.
+  event.dataTransfer.dropEffect =
+    connected &&
+    !sending &&
+    !loggingOut &&
+    !roomBusy &&
+    !document.querySelector("dialog[open]")
+      ? "copy"
+      : "none";
+});
+document.addEventListener("dragleave", (event) => {
+  if (!fileDrag(event)) return;
+  if (--dragDepth <= 0) resetDrag();
+});
+document.addEventListener("dragend", resetDrag);
+window.addEventListener("blur", resetDrag);
+document.addEventListener("drop", (event) => {
+  if (!fileDrag(event)) return;
+  event.preventDefault();
+  resetDrag();
+  const items = [...(event.dataTransfer.items || [])];
+  const files = items.length
+    ? items
+        .filter(
+          (item) =>
+            item.kind === "file" && !item.webkitGetAsEntry?.()?.isDirectory,
+        )
+        .map((item) => item.getAsFile())
+        .filter(Boolean)
+    : [...event.dataTransfer.files];
+  if (items.some((item) => item.webkitGetAsEntry?.()?.isDirectory))
+    notice("Drop files, not folders.");
+  if (files.length) addFiles(files);
+});
+document.addEventListener("paste", (event) => {
+  if (
+    document.querySelector("dialog[open]") ||
+    !connected ||
+    sending ||
+    loggingOut ||
+    roomBusy
+  )
+    return;
+  if (
+    event.target !== input &&
+    event.target.closest?.("input, textarea, [contenteditable]")
+  )
+    return;
+  const images = [...(event.clipboardData?.items || [])]
+    .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+    .map((item) => item.getAsFile())
+    .filter(Boolean);
+  if (!images.length) return; // Ordinary text paste keeps the browser's normal behavior.
+  event.preventDefault();
+  const text = event.clipboardData.getData("text/plain");
+  if (text) {
+    const available =
+      input.maxLength -
+      input.value.length +
+      input.selectionEnd -
+      input.selectionStart;
+    input.setRangeText(
+      text.slice(0, Math.max(0, available)),
+      input.selectionStart,
+      input.selectionEnd,
+      "end",
+    );
+  }
+  addFiles(
+    images.map((file, index) => {
+      if (file.name) return file;
+      const extension =
+        {
+          "image/png": "png",
+          "image/jpeg": "jpg",
+          "image/webp": "webp",
+          "image/gif": "gif",
+          "image/avif": "avif",
+          "image/bmp": "bmp",
+          "image/svg+xml": "svg",
+        }[file.type] || "bin";
+      return new File(
+        [file],
+        `pasted-image-${Date.now()}-${index}.${extension}`,
+        { type: file.type },
+      );
+    }),
+  );
+});
+$("#reply-cancel").addEventListener("click", () => {
+  replyTarget = null;
+  updateReply();
+  input.focus();
+});
+$("#search-button").addEventListener("click", () => {
+  $("#search-bar").hidden = false;
+  updateSearch();
+  $("#search-input").focus();
+  $("#search-input").select();
+});
+$("#search-close").addEventListener("click", () => {
+  closeSearch();
+  input.focus();
+});
+$("#search-input").addEventListener("input", updateSearch);
+$("#search-input").addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeSearch();
+    input.focus();
+  } else if (event.key === "Enter") {
+    event.preventDefault();
+    messages
+      .querySelector(".message:not([hidden])")
+      ?.scrollIntoView({ block: "center" });
+  }
+});
+document.addEventListener("keydown", (event) => {
+  if (
+    (event.ctrlKey || event.metaKey) &&
+    event.key.toLowerCase() === "f" &&
+    connected &&
+    !document.querySelector("dialog[open]")
+  ) {
+    event.preventDefault();
+    $("#search-button").click();
+  }
 });
 input.addEventListener("input", updateComposer);
 input.addEventListener("keydown", (event) => {

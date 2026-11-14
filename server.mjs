@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
 import { AttachmentStore, downloadDisposition } from "./attachments.mjs";
 import { RoomStore, roomInfo } from "./rooms.mjs";
+import { findMentions, messagePreview } from "./public/chat-text.js";
 
 const MAX_MESSAGES = 100;
 const MAX_LENGTH = 2000;
@@ -13,6 +14,7 @@ const SESSION_TTL = 24 * 60 * 60 * 1000;
 const files = new Map([
   ["/", ["index.html", "text/html; charset=utf-8"]],
   ["/app.js", ["app.js", "text/javascript; charset=utf-8"]],
+  ["/chat-text.js", ["chat-text.js", "text/javascript; charset=utf-8"]],
   ["/unread.js", ["unread.js", "text/javascript; charset=utf-8"]],
   ["/uploads.js", ["uploads.js", "text/javascript; charset=utf-8"]],
   ["/notifications.js", ["notifications.js", "text/javascript; charset=utf-8"]],
@@ -528,7 +530,14 @@ export function createChatServer(
           const requestKey = clientMessageId
             ? `${session.identity.id}:${clientMessageId}`
             : null;
-          const signature = JSON.stringify({ text, ids });
+          const replyToId = input?.replyToId ?? null;
+          if (
+            replyToId !== null &&
+            (typeof replyToId !== "string" ||
+              !/^[a-f0-9-]{36}$/.test(replyToId))
+          )
+            return json(response, 400, { error: "Invalid reply target." });
+          const signature = JSON.stringify({ text, ids, replyToId });
           const prior = requestKey && room.messageRequests.get(requestKey);
           if (prior) {
             if (prior.signature !== signature)
@@ -537,6 +546,15 @@ export function createChatServer(
               });
             return json(response, 201, { message: prior.message });
           }
+          const replyTarget =
+            replyToId &&
+            room.messages.find((message) => message.id === replyToId);
+          if (replyToId && !replyTarget)
+            return json(response, 400, {
+              error:
+                "Original message is no longer in this room's history. Cancel the reply or choose another message.",
+              code: "REPLY_UNAVAILABLE",
+            });
           attachments.prune();
           const attachedFiles = ids.map((id) => attachments.get(id));
           if (
@@ -575,6 +593,15 @@ export function createChatServer(
             text,
             time: new Date().toISOString(),
           };
+          if (replyTarget)
+            message.replyTo = {
+              id: replyTarget.id,
+              userId: replyTarget.userId,
+              name: replyTarget.name,
+              preview: messagePreview(replyTarget),
+            };
+          const mentions = findMentions(text, online(session.roomName));
+          if (mentions.length) message.mentions = mentions;
           for (const file of attachedFiles) file.attached = true;
           if (legacy)
             message.attachment = attachments.metadata(attachedFiles[0]);
@@ -723,7 +750,9 @@ export function createChatServer(
           error: error.status
             ? error.message
             : "Something went wrong. Please try again.",
-          ...(error.code === "NICKNAME_TAKEN" ? { code: error.code } : {}),
+          ...(["NICKNAME_TAKEN", "REPLY_UNAVAILABLE"].includes(error.code)
+            ? { code: error.code }
+            : {}),
         });
     }
   });

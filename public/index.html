@@ -16,10 +16,33 @@
     <main class="terminal">
       <header class="statusbar">
         <h1>localchat<span id="room-title" class="path"> / #general</span></h1>
+        <button
+          id="search-button"
+          type="button"
+          disabled
+          title="Search current room (Ctrl+F)"
+        >
+          [search]
+        </button>
         <button id="rooms-button" type="button" disabled>[rooms]</button>
         <button id="settings-button" type="button">[settings]</button>
         <button id="logout-button" type="button" hidden>[logout]</button>
       </header>
+      <div id="search-bar" class="search-bar" hidden>
+        <label for="search-input">find:</label>
+        <input
+          id="search-input"
+          type="search"
+          maxlength="2000"
+          autocomplete="off"
+          placeholder="text, nickname or file name…"
+        />
+        <span id="search-count" role="status"></span>
+        <button id="search-close" type="button" aria-label="Close search">
+          [close]
+        </button>
+      </div>
+      <div id="drop-hint" class="drop-hint" hidden>[drop files to attach]</div>
       <div class="workspace">
         <section
           id="messages"
@@ -53,6 +76,12 @@
         </button>
         <span id="connection-text" class="sr-only" role="status"></span>
         <div id="notice" class="notice" role="status" hidden></div>
+        <div id="reply-draft" class="reply-draft" hidden>
+          <span id="reply-preview"></span>
+          <button id="reply-cancel" type="button" aria-label="Cancel reply">
+            [cancel reply]
+          </button>
+        </div>
         <div id="selected-file" class="selected-file" hidden>
           <span id="file-status" role="status"></span>
           <progress

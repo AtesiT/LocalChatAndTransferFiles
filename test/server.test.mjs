@@ -1589,3 +1589,208 @@ test("an authenticated request waiting for its body cannot reclaim a nickname af
   assert.equal(await completed, 401);
   assert.equal((await post("/api/nickname", { name: "Alice" })).status, 201);
 });
+
+test("replies use a bounded server-authored snapshot and reject foreign-room or forged targets", async (t) => {
+  const { base, post } = await setup(t);
+  const alice = await post("/api/session", { name: "Alice" });
+  const bob = await post("/api/session", { name: "Bob" });
+  const bobStream = await events(base, bob.token, t);
+  await bobStream.next("ready");
+  const original = (
+    await post("/api/messages", { text: "Original question" }, alice.token)
+  ).message;
+  const response = await post(
+    "/api/messages",
+    {
+      text: "Answer",
+      replyToId: original.id,
+      replyTo: { name: "Forged", preview: "Forged" },
+      clientMessageId: "reply-request-123456",
+    },
+    bob.token,
+  );
+  assert.equal(response.status, 201);
+  assert.deepEqual(response.message.replyTo, {
+    id: original.id,
+    userId: alice.user.id,
+    name: "Alice",
+    preview: "Original question",
+  });
+  await bobStream.next("message"); // original
+  assert.deepEqual(
+    (await bobStream.next("message")).replyTo,
+    response.message.replyTo,
+  );
+  const repeated = await post(
+    "/api/messages",
+    {
+      text: "Answer",
+      replyToId: original.id,
+      clientMessageId: "reply-request-123456",
+    },
+    bob.token,
+  );
+  assert.equal(repeated.message.id, response.message.id);
+  assert.equal(
+    (
+      await post(
+        "/api/messages",
+        {
+          text: "Answer",
+          replyToId: null,
+          clientMessageId: "reply-request-123456",
+        },
+        bob.token,
+      )
+    ).status,
+    409,
+  );
+  const room = await post("/api/rooms", { name: "reply-private" }, alice.token);
+  const secret = (await post("/api/messages", { text: "Secret" }, room.token))
+    .message;
+  for (const id of [
+    secret.id,
+    "00000000-0000-0000-0000-000000000000",
+    {},
+    "invalid",
+  ]) {
+    const invalid = await post(
+      "/api/messages",
+      { text: "No", replyToId: id },
+      bob.token,
+    );
+    assert.equal(invalid.status, 400);
+    assert.equal(invalid.message, undefined);
+  }
+  assert.equal(
+    (
+      await post(
+        "/api/messages",
+        { text: "", replyToId: original.id },
+        bob.token,
+      )
+    ).status,
+    400,
+    "a quote is not an otherwise empty message",
+  );
+});
+
+test("reply snapshots survive target eviction; retries deduplicate even when the original has expired", async (t) => {
+  const { base, post } = await setup(t);
+  const alice = await post("/api/session", { name: "Alice" });
+  const original = (
+    await post("/api/messages", { text: "😀".repeat(300) }, alice.token)
+  ).message;
+  const payload = {
+    text: "Answer",
+    replyToId: original.id,
+    clientMessageId: "retained-reply-123456",
+  };
+  const reply = (await post("/api/messages", payload, alice.token)).message;
+  assert.equal([...reply.replyTo.preview].length, 240);
+  for (let i = 0; i < 9; i++) {
+    const session = await post("/api/session", { name: "Alice" }, alice.token);
+    for (let j = 0; j < 11; j++)
+      assert.equal(
+        (await post("/api/messages", { text: `fill ${i}-${j}` }, session.token))
+          .status,
+        201,
+      );
+  }
+  assert.equal(
+    (
+      await post(
+        "/api/messages",
+        { text: "stale", replyToId: original.id },
+        alice.token,
+      )
+    ).code,
+    "REPLY_UNAVAILABLE",
+  );
+  assert.equal(
+    (await post("/api/messages", payload, alice.token)).message.id,
+    reply.id,
+  );
+  const history = await events(base, alice.token, t);
+  const ready = await history.next("ready");
+  assert.equal(
+    ready.messages.some((message) => message.id === original.id),
+    false,
+  );
+  assert.deepEqual(
+    ready.messages.find((message) => message.id === reply.id).replyTo,
+    reply.replyTo,
+  );
+});
+
+test("file-only replies and attachment validation are atomic", async (t) => {
+  const { base, post } = await setup(t);
+  const alice = await post("/api/session", { name: "Alice" });
+  const file = (await upload(base, alice.token, "original.txt", "data"))
+    .attachment;
+  const original = (
+    await post("/api/messages", { attachmentId: file.id }, alice.token)
+  ).message;
+  const attachment = (await declare(base, alice.token, "answer.txt", 0)).upload;
+  const invalid = await post(
+    "/api/messages",
+    {
+      attachmentIds: [attachment.id],
+      replyToId: "00000000-0000-0000-0000-000000000000",
+    },
+    alice.token,
+  );
+  assert.equal(invalid.status, 400);
+  const reply = await post(
+    "/api/messages",
+    { attachmentIds: [attachment.id], replyToId: original.id },
+    alice.token,
+  );
+  assert.equal(reply.status, 201);
+  assert.equal(reply.message.replyTo.preview, "original.txt");
+  assert.equal(reply.message.attachments.length, 1);
+});
+
+test("mentions are server-derived from online room participants and retain identity across rename", async (t) => {
+  const { base, post } = await setup(t);
+  const alice = await post("/api/session", { name: "Alice" });
+  const bob = await post("/api/session", { name: "Боб Smith" });
+  const bobStream = await events(base, bob.token, t);
+  await bobStream.next("ready");
+  const privateRoom = await post("/api/rooms", {
+    name: "mention-private",
+    nickname: "Secret",
+  });
+  const privateStream = await events(base, privateRoom.token, t);
+  await privateStream.next("ready");
+  const text = "Hello @БОБ Smith! @Secret @Unknown me@Боб Smith";
+  const message = (
+    await post(
+      "/api/messages",
+      { text, mentions: [{ id: privateRoom.user.id }] },
+      alice.token,
+    )
+  ).message;
+  assert.equal(message.mentions.length, 1);
+  assert.equal(message.mentions[0].id, bob.user.id);
+  assert.equal(
+    text.slice(message.mentions[0].start, message.mentions[0].end),
+    "@БОБ Smith",
+  );
+  await post("/api/session", { name: "Robert", room: "general" }, bob.token);
+  assert.equal(
+    (await post("/api/messages", { text: "@Боб Smith" }, alice.token)).message
+      .mentions,
+    undefined,
+  );
+  assert.equal(
+    (await post("/api/messages", { text: "@Robert" }, alice.token)).message
+      .mentions[0].id,
+    bob.user.id,
+  );
+  assert.equal(
+    message.mentions[0].name,
+    "Боб Smith",
+    "published metadata never silently changes on rename",
+  );
+});
