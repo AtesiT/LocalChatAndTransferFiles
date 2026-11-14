@@ -44,10 +44,11 @@ export class AttachmentStore {
     }
   }
 
-  removeOwner(identityId, sessionIds) {
+  removeOwner(identityId, sessionIds, roomName = null) {
     for (const file of [...this.files.values(), ...this.uploads.values()]) {
       if (
         !file.attached &&
+        (roomName === null || file.roomName === roomName) &&
         (file.ownerIdentityId === identityId || sessionIds.has(file.ownerId))
       )
         this.remove(file.id);

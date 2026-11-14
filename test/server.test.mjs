@@ -542,6 +542,7 @@ test("creates public/protected rooms and validates room entry grants", async (t)
     id: secret.room.id,
     name: "secret",
     protected: true,
+    isOwner: true,
   });
   assert.equal(secret.user.name, "Alice");
   assert.equal(
@@ -550,11 +551,11 @@ test("creates public/protected rooms and validates room entry grants", async (t)
   );
   assert.equal(
     (
-      await post(
-        "/api/session",
-        { name: "Bob", room: "secret", password: "wrong" },
-        alice.token,
-      )
+      await post("/api/session", {
+        name: "Bob",
+        room: "secret",
+        password: "wrong",
+      })
     ).status,
     403,
   );
@@ -580,6 +581,7 @@ test("creates public/protected rooms and validates room entry grants", async (t)
     id: open.room.id,
     name: "open",
     protected: false,
+    isOwner: true,
   });
   assert.equal(
     (await post("/api/session", { name: "Carol", room: "open" })).status,
@@ -1792,5 +1794,530 @@ test("mentions are server-derived from online room participants and retain ident
     message.mentions[0].name,
     "Боб Smith",
     "published metadata never silently changes on rename",
+  );
+});
+
+const manage = (post, owner, action, input = {}) =>
+  post(`/api/rooms/${owner.room.id}/${action}`, input, owner.token);
+
+test("room management is creator-only, generation-scoped, and never available in general", async (t) => {
+  const { base, post } = await setup(t);
+  const alice = await post("/api/session", { name: "Alice" });
+  const owner = await post(
+    "/api/rooms",
+    { name: "owned", password: "old" },
+    alice.token,
+  );
+  const guest = await post("/api/session", {
+    name: "Guest",
+    room: "owned",
+    password: "old",
+  });
+  assert.equal(owner.room.isOwner, true);
+  assert.equal(guest.room.isOwner, false);
+  assert.equal(alice.room.isOwner, false);
+  for (const action of ["delete", "kick", "password"]) {
+    const input = {
+      confirmName: "owned",
+      userId: owner.user.id,
+      password: "hijack",
+      isOwner: true,
+    };
+    assert.equal(
+      (await post(`/api/rooms/${owner.room.id}/${action}`, input)).status,
+      401,
+    );
+    assert.equal(
+      (await post(`/api/rooms/${owner.room.id}/${action}`, input, guest.token))
+        .status,
+      403,
+    );
+    assert.equal(
+      (await post(`/api/rooms/${owner.room.id}/${action}`, input, alice.token))
+        .status,
+      404,
+      "another room's grant is not management access",
+    );
+    assert.equal(
+      (await manage(post, alice, action, input)).status,
+      403,
+      "general has no creator controls",
+    );
+  }
+  assert.equal(
+    (await manage(post, owner, "kick", { userId: owner.user.id })).status,
+    400,
+  );
+  assert.equal(
+    (await manage(post, owner, "delete", { confirmName: "wrong" })).status,
+    400,
+  );
+  assert.equal(
+    (await manage(post, owner, "password", { password: "x".repeat(129) }))
+      .status,
+    400,
+  );
+  assert.equal(
+    (
+      await post(
+        `/api/rooms/${owner.room.id}/password`,
+        { password: "bad" },
+        owner.token,
+        { Origin: "https://evil.example" },
+      )
+    ).status,
+    403,
+  );
+  const renamed = await post(
+    "/api/session",
+    { name: "Renamed", room: "owned" },
+    owner.token,
+  );
+  assert.equal(renamed.room.isOwner, true);
+  const resumed = await post(
+    "/api/session",
+    { name: "Renamed", room: "owned" },
+    owner.identityToken,
+  );
+  assert.equal(
+    resumed.status,
+    201,
+    "creator identity can recover their own room grant without the password",
+  );
+  assert.equal(resumed.room.isOwner, true);
+  const info = await (
+    await fetch(base + "/api/session", {
+      headers: { Authorization: `Bearer ${resumed.token}` },
+    })
+  ).json();
+  assert.equal(info.room.isOwner, true);
+  const publicList = await (await fetch(base + "/api/rooms")).json();
+  assert.equal(
+    "ownerId" in publicList.rooms.find((room) => room.id === owner.room.id),
+    false,
+  );
+  assert.equal(
+    "isOwner" in publicList.rooms.find((room) => room.id === owner.room.id),
+    false,
+  );
+});
+
+test("password rotation revokes all guest room grants, keeps creator/other rooms, and releases only guest pending files", async (t) => {
+  const { base, post } = await setup(t, { maxStorageSize: 12 });
+  const owner = await post("/api/rooms", {
+    name: "rotate",
+    password: "old",
+    nickname: "Owner",
+  });
+  const guest = await post("/api/session", {
+    name: "Guest",
+    room: "rotate",
+    password: "old",
+  });
+  const duplicate = await post(
+    "/api/session",
+    { name: "Guest", room: "rotate" },
+    guest.token,
+  );
+  const lobby = await post(
+    "/api/session",
+    { name: "Guest", room: "general" },
+    guest.identityToken,
+  );
+  const ownerStream = await events(base, owner.token, t);
+  const guestStream = await events(base, guest.token, t);
+  const duplicateStream = await events(base, duplicate.token, t);
+  const lobbyStream = await events(base, lobby.token, t);
+  for (const stream of [ownerStream, guestStream, duplicateStream, lobbyStream])
+    await stream.next("ready");
+  const shared = (await upload(base, owner.token, "shared.txt", "keep"))
+    .attachment;
+  await post("/api/messages", { attachmentId: shared.id }, owner.token);
+  const ownerPending = (
+    await declare(base, owner.token, "owner", 2, "owner-pending-123456")
+  ).upload;
+  const guestPending = (
+    await declare(base, guest.token, "guest", 4, "guest-pending-123456")
+  ).upload;
+  const lobbyPending = (
+    await declare(base, lobby.token, "lobby", 2, "lobby-pending-123456")
+  ).upload;
+  const changed = await manage(post, owner, "password", { password: "new" });
+  assert.equal(changed.status, 200);
+  assert.equal(changed.room.protected, true);
+  assert.equal(changed.room.isOwner, true);
+  assert.equal((await ownerStream.next("room-updated")).isOwner, true);
+  for (const stream of [guestStream, duplicateStream, lobbyStream])
+    assert.deepEqual(await stream.next("room-left"), {
+      roomId: owner.room.id,
+      reason: "password-changed",
+    });
+  for (const token of [guest.token, duplicate.token]) {
+    assert.equal(
+      (await post("/api/messages", { text: "revoked" }, token)).status,
+      401,
+    );
+    assert.equal(
+      (await fetch(`${base}/api/files/${shared.id}?token=${token}`)).status,
+      401,
+    );
+    assert.equal(
+      (await resumableApi(base, token, "GET", guestPending.id)).status,
+      401,
+    );
+  }
+  assert.equal(
+    (
+      await post(
+        "/api/messages",
+        { text: "other room still works" },
+        lobby.token,
+      )
+    ).status,
+    201,
+  );
+  assert.equal(
+    (await resumableApi(base, lobby.token, "GET", lobbyPending.id)).status,
+    200,
+  );
+  assert.equal(
+    (await resumableApi(base, owner.token, "GET", ownerPending.id)).status,
+    200,
+  );
+  assert.equal(
+    (await declare(base, owner.token, "released", 4, "released-pending-123456"))
+      .status,
+    201,
+  );
+  assert.equal(
+    (
+      await post(
+        "/api/session",
+        { name: "Guest", room: "rotate", password: "old" },
+        guest.identityToken,
+      )
+    ).status,
+    403,
+  );
+  const rejoined = await post(
+    "/api/session",
+    { name: "Guest", room: "rotate", password: "new" },
+    guest.identityToken,
+  );
+  assert.equal(rejoined.status, 201);
+  assert.equal(rejoined.room.isOwner, false);
+  assert.equal(
+    (await resumableApi(base, rejoined.token, "GET", guestPending.id)).status,
+    404,
+  );
+  assert.equal(
+    await (
+      await fetch(`${base}/api/files/${shared.id}?token=${rejoined.token}`)
+    ).text(),
+    "keep",
+  );
+  assert.equal(
+    (await manage(post, owner, "password", { password: "" })).room.protected,
+    false,
+  );
+  assert.equal(
+    (await post("/api/session", { name: "Public", room: "rotate" })).status,
+    201,
+  );
+});
+
+test("kick disconnects every target grant in this room without releasing the nickname or banning re-entry", async (t) => {
+  const { base, post } = await setup(t);
+  const owner = await post("/api/rooms", { name: "kick", nickname: "Owner" });
+  const guest = await post("/api/session", { name: "Guest", room: "kick" });
+  const duplicate = await post(
+    "/api/session",
+    { name: "Guest", room: "kick" },
+    guest.token,
+  );
+  const streams = [];
+  for (const token of [owner.token, guest.token, duplicate.token]) {
+    const stream = await events(base, token, t);
+    await stream.next("ready");
+    streams.push(stream);
+  }
+  const file = (await upload(base, guest.token, "published", "bytes"))
+    .attachment;
+  await post("/api/messages", { attachmentId: file.id }, guest.token);
+  const pending = (await declare(base, guest.token)).upload;
+  assert.equal(
+    (await manage(post, owner, "kick", { userId: guest.user.id })).status,
+    200,
+  );
+  for (const stream of streams.slice(1))
+    assert.equal((await stream.next("room-left")).reason, "kicked");
+  for (const token of [guest.token, duplicate.token])
+    assert.equal(
+      (
+        await fetch(base + "/api/session", {
+          headers: { Authorization: `Bearer ${token}` },
+        })
+      ).status,
+      401,
+    );
+  assert.equal(
+    (await post("/api/nickname", { name: "Guest" })).status,
+    409,
+    "kick does not release nickname ownership",
+  );
+  assert.equal(
+    (await manage(post, owner, "kick", { userId: guest.user.id })).status,
+    404,
+  );
+  const rooms = await (await fetch(base + "/api/rooms")).json();
+  assert.equal(rooms.rooms.find((room) => room.id === owner.room.id).count, 1);
+  const rejoined = await post(
+    "/api/session",
+    { name: "Guest", room: "kick" },
+    guest.identityToken,
+  );
+  assert.equal(rejoined.status, 201, "kick is not a ban");
+  assert.equal(
+    (await resumableApi(base, rejoined.token, "GET", pending.id)).status,
+    404,
+  );
+  assert.equal(
+    await (
+      await fetch(`${base}/api/files/${file.id}?token=${rejoined.token}`)
+    ).text(),
+    "bytes",
+    "published history is not erased by kick",
+  );
+});
+
+test("creator deletion immediately clears room data, revokes tokens and preserves nickname identities", async (t) => {
+  const { base, post } = await setup(t, { maxStorageSize: 8 });
+  const owner = await post("/api/rooms", {
+    name: "delete-me",
+    nickname: "Owner",
+  });
+  const guest = await post("/api/session", {
+    name: "Guest",
+    room: "delete-me",
+  });
+  const streams = [];
+  for (const token of [owner.token, guest.token]) {
+    const stream = await events(base, token, t);
+    await stream.next("ready");
+    streams.push(stream);
+  }
+  const file = (await upload(base, guest.token, "file", "1234")).attachment;
+  await post(
+    "/api/messages",
+    { text: "private history", attachmentId: file.id },
+    guest.token,
+  );
+  await declare(base, owner.token, "pending", 4);
+  assert.equal(
+    (await manage(post, owner, "delete", { confirmName: "delete-me" })).status,
+    200,
+  );
+  for (const stream of streams)
+    assert.equal((await stream.next("room-left")).reason, "deleted");
+  const catalog = await (await fetch(base + "/api/rooms")).json();
+  assert.equal(
+    catalog.rooms.some((room) => room.id === owner.room.id),
+    false,
+  );
+  for (const token of [owner.token, guest.token])
+    assert.equal(
+      (await post("/api/messages", { text: "revoked" }, token)).status,
+      401,
+    );
+  for (const token of [owner.identityToken, guest.identityToken])
+    assert.equal(
+      (
+        await fetch(base + "/api/nickname", {
+          headers: { Authorization: `Bearer ${token}` },
+        })
+      ).status,
+      200,
+    );
+  const replacement = await post(
+    "/api/rooms",
+    { name: "delete-me" },
+    guest.identityToken,
+  );
+  assert.notEqual(replacement.room.id, owner.room.id);
+  assert.equal(replacement.room.isOwner, true);
+  assert.equal(
+    (
+      await manage(post, { ...owner, token: replacement.token }, "delete", {
+        confirmName: "delete-me",
+      })
+    ).status,
+    404,
+  );
+  const ready = await (await events(base, replacement.token, t)).next("ready");
+  assert.equal(ready.messages.length, 0);
+  assert.equal(
+    (await fetch(`${base}/api/files/${file.id}?token=${replacement.token}`))
+      .status,
+    404,
+  );
+  assert.equal(
+    (
+      await declare(
+        base,
+        replacement.token,
+        "full-size",
+        8,
+        "full-size-pending-123456",
+      )
+    ).status,
+    201,
+  );
+});
+
+test("reusing a creator's nickname after logout never transfers ownership", async (t) => {
+  const { post } = await setup(t);
+  const owner = await post("/api/rooms", {
+    name: "orphaned",
+    nickname: "Owner",
+  });
+  const guest = await post("/api/session", { name: "Guest", room: "orphaned" });
+  assert.equal((await post("/api/logout", {}, owner.token)).status, 200);
+  const impostor = await post("/api/session", {
+    name: "Owner",
+    room: "orphaned",
+  });
+  assert.notEqual(impostor.user.id, owner.user.id);
+  assert.equal(impostor.room.isOwner, false);
+  assert.equal(
+    (
+      await manage(post, { ...owner, token: impostor.token }, "delete", {
+        confirmName: "orphaned",
+      })
+    ).status,
+    403,
+  );
+  assert.equal(
+    (await post("/api/messages", { text: "room still available" }, guest.token))
+      .status,
+    201,
+  );
+});
+
+test("kicking during an active chunk cannot revive the upload or keep its reservation", async (t) => {
+  const { base, post, server } = await setup(t, {
+    maxFileSize: 8,
+    maxStorageSize: 8,
+  });
+  const owner = await post("/api/rooms", {
+    name: "kick-upload",
+    nickname: "Owner",
+  });
+  const guest = await post("/api/session", {
+    name: "Guest",
+    room: "kick-upload",
+  });
+  const { upload: pending } = await declare(base, guest.token);
+  const arrived = once(server, "request");
+  let request;
+  const completed = new Promise((resolve, reject) => {
+    request = http.request(
+      `${base}/api/uploads/${pending.id}`,
+      {
+        method: "PATCH",
+        headers: {
+          Authorization: `Bearer ${guest.token}`,
+          "Content-Type": "application/octet-stream",
+          "Upload-Offset": "0",
+          "Content-Length": "8",
+        },
+      },
+      (response) => {
+        response.resume();
+        response.on("end", () => resolve(response.statusCode));
+      },
+    );
+    request.on("error", reject);
+    request.write("abcd");
+  });
+  await arrived;
+  assert.equal(
+    (await manage(post, owner, "kick", { userId: guest.user.id })).status,
+    200,
+  );
+  request.end("efgh");
+  assert.equal(await completed, 404);
+  assert.equal(
+    (await declare(base, owner.token, "full", 8, "replacement-12345678"))
+      .status,
+    201,
+  );
+  const rejoined = await post(
+    "/api/session",
+    { name: "Guest", room: "kick-upload" },
+    guest.identityToken,
+  );
+  assert.equal(
+    (await resumableApi(base, rejoined.token, "GET", pending.id)).status,
+    404,
+  );
+});
+
+test("a guest's pending room-entry request cannot reuse a grant revoked by a kick", async (t) => {
+  const { base, post, server } = await setup(t);
+  const owner = await post("/api/rooms", {
+    name: "kick-entry",
+    password: "secret",
+    nickname: "Owner",
+  });
+  const guest = await post("/api/session", {
+    name: "Guest",
+    room: "kick-entry",
+    password: "secret",
+  });
+  const arrived = once(server, "request");
+  let request;
+  const completed = new Promise((resolve, reject) => {
+    request = http.request(
+      base + "/api/session",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${guest.token}`,
+          "Content-Type": "application/json",
+        },
+      },
+      (response) => {
+        response.resume();
+        response.on("end", () => resolve(response.statusCode));
+      },
+    );
+    request.on("error", reject);
+    request.write('{"name":"Guest",');
+  });
+  await arrived;
+  await manage(post, owner, "kick", { userId: guest.user.id });
+  request.end('"room":"kick-entry"}');
+  assert.equal(await completed, 401);
+});
+
+test("room-management attempts are rate-limited per creator identity", async (t) => {
+  const { post } = await setup(t);
+  const owner = await post("/api/rooms", {
+    name: "management-limit",
+    nickname: "Owner",
+  });
+  for (let i = 0; i < 12; i++)
+    assert.equal(
+      (await manage(post, owner, "kick", { userId: "missing" })).status,
+      404,
+    );
+  const renewed = await post(
+    "/api/session",
+    { name: "Owner", room: "management-limit" },
+    owner.identityToken,
+  );
+  assert.equal(
+    (await manage(post, renewed, "password", { password: "new" })).status,
+    429,
   );
 });

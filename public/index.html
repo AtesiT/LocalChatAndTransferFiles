@@ -25,6 +25,7 @@
           [search]
         </button>
         <button id="rooms-button" type="button" disabled>[rooms]</button>
+        <button id="manage-button" type="button" hidden>[manage]</button>
         <button id="settings-button" type="button">[settings]</button>
         <button id="logout-button" type="button" hidden>[logout]</button>
       </header>
@@ -254,6 +255,48 @@
           ><button id="rename-close" type="button">[close]</button>
         </div>
       </form>
+    </dialog>
+    <dialog id="manage-dialog" aria-labelledby="manage-title">
+      <section>
+        <h2 id="manage-title">localchat / manage room</h2>
+        <p class="room-help">
+          Creator controls. Changes apply to this room only.
+        </p>
+        <label for="manage-password">new password:</label>
+        <input
+          id="manage-password"
+          type="password"
+          maxlength="256"
+          autocomplete="off"
+          data-lpignore="true"
+          data-1p-ignore="true"
+        />
+        <p class="room-help">
+          Blank makes the room public. Other participants must rejoin after a
+          password change.
+        </p>
+        <button id="save-room-password" type="button">[change password]</button>
+        <h3>participants</h3>
+        <ul id="manage-members"></ul>
+        <p class="room-help">
+          Removal ends all of a participant's access grants in this room. This
+          is not a ban: they may rejoin if they know the current password.
+        </p>
+        <label for="delete-room-confirm"
+          >type the room name to delete it:</label
+        >
+        <input id="delete-room-confirm" autocomplete="off" spellcheck="false" />
+        <p class="room-help">
+          Deletes all room messages and files and disconnects everyone. This
+          cannot be undone.
+        </p>
+        <button id="delete-room-button" type="button">[delete room]</button>
+        <p id="manage-error" class="error" role="alert"></p>
+        <p id="manage-status" role="status"></p>
+        <div class="room-actions">
+          <button id="manage-close" type="button">[close]</button>
+        </div>
+      </section>
     </dialog>
     <dialog id="settings-dialog" aria-labelledby="settings-title">
       <section>

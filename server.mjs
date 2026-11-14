@@ -65,18 +65,14 @@ export function createChatServer(
     for (const response of roomWatchers) send(response, "rooms", snapshot);
   };
   const scheduleEmpty = (room) => {
+    if (rooms.get(room.name) !== room) return;
     clearTimeout(emptyTimers.get(room.name));
     emptyTimers.delete(room.name);
     if (stopping || room.name === "general" || online(room.name).length) return;
     const timer = setTimeout(() => {
       emptyTimers.delete(room.name);
       if (rooms.get(room.name) !== room || online(room.name).length) return;
-      rooms.rooms.delete(room.name);
-      attachments.removeRoom(room.name);
-      for (const [token, session] of sessions)
-        if (session.room === room && session.roomName !== null)
-          sessions.delete(token);
-      publishRooms();
+      deleteRoom(room, "expired");
     }, roomGraceMs);
     timer.unref();
     emptyTimers.set(room.name, timer);
@@ -91,6 +87,47 @@ export function createChatServer(
     publishRooms();
     scheduleEmpty(session.room);
   };
+  const revokeRoom = (room, reason, predicate = () => true) => {
+    const affected = new Map();
+    for (const [token, session] of sessions) {
+      if (session.room !== room || !predicate(session)) continue;
+      sessions.delete(token);
+      const entry = affected.get(session.identity.id) || {
+        identity: session.identity,
+        sessions: new Set(),
+      };
+      entry.sessions.add(session.id);
+      affected.set(session.identity.id, entry);
+    }
+    for (const { identity, sessions: ids } of affected.values())
+      attachments.removeOwner(identity.id, ids, room.name);
+    for (const client of [...clients]) {
+      if (!affected.has(client.session.identity.id)) continue;
+      // Also discard a revoked room's draft in tabs currently viewing another room.
+      send(client.response, "room-left", { roomId: room.id, reason });
+      if (client.session.room === room && predicate(client.session)) {
+        disconnect(client);
+        client.response.end();
+      }
+    }
+    publishRooms();
+  };
+  const deleteRoom = (room, reason = "deleted") => {
+    if (room.name === "general" || rooms.get(room.name) !== room) return;
+    clearTimeout(emptyTimers.get(room.name));
+    emptyTimers.delete(room.name);
+    rooms.rooms.delete(room.name);
+    attachments.removeRoom(room.name);
+    revokeRoom(room, reason);
+    room.messages.length = 0;
+    room.messageRequests?.clear();
+  };
+  const sessionRoomInfo = (session) => ({
+    ...roomInfo(session.room),
+    isOwner:
+      session.room.name !== "general" &&
+      session.room.ownerId === session.identity.id,
+  });
   const validateNickname = (value) => {
     const name =
       typeof value === "string" ? value.trim().replace(/\s+/g, " ") : "";
@@ -184,7 +221,7 @@ export function createChatServer(
       token,
       identityToken: identity.token,
       user: { id: identity.id, name: identity.name },
-      room: roomInfo(session.room),
+      room: sessionRoomInfo(session),
     };
   };
   const authenticate = (request, token, roomRequired = true) => {
@@ -337,6 +374,87 @@ export function createChatServer(
         }
         if (!request.headers["content-type"]?.startsWith("application/json"))
           return json(response, 415, { error: "Use application/json." });
+        const management =
+          /^\/api\/rooms\/([a-f0-9-]+)\/(password|kick|delete)$/.exec(
+            url.pathname,
+          );
+        if (management) {
+          const session = authenticate(request);
+          if (!session)
+            return json(response, 401, {
+              error: "Please join the room again.",
+            });
+          const room = session.room;
+          if (room.id !== management[1])
+            return json(response, 404, { error: "Room is unavailable." });
+          if (room.name === "general" || room.ownerId !== session.identity.id)
+            return json(response, 403, {
+              error: "Only the room creator can manage this room.",
+            });
+          const input = await body(request);
+          if (authenticate(request) !== session)
+            return json(response, 401, { error: "Room access ended." });
+          session.identity.managementTimes = (
+            session.identity.managementTimes || []
+          ).filter((time) => Date.now() - time < 60000);
+          if (session.identity.managementTimes.length >= 12)
+            return json(response, 429, {
+              error: "Too many room changes. Try again in a minute.",
+            });
+          session.identity.managementTimes.push(Date.now());
+          if (management[2] === "delete") {
+            if (input?.confirmName !== room.name)
+              return json(response, 400, {
+                error: "Type the room name to confirm deletion.",
+              });
+            deleteRoom(room);
+            return json(response, 200, { deleted: true });
+          }
+          if (management[2] === "kick") {
+            if (
+              typeof input?.userId !== "string" ||
+              input.userId === room.ownerId
+            )
+              return json(response, 400, {
+                error: "Choose another participant to remove.",
+              });
+            const member = [...sessions.values()].some(
+              (entry) =>
+                entry.room === room && entry.identity.id === input.userId,
+            );
+            if (!member)
+              return json(response, 404, {
+                error: "Participant is no longer in this room.",
+              });
+            room.revision++;
+            revokeRoom(
+              room,
+              "kicked",
+              (entry) => entry.identity.id === input.userId,
+            );
+            return json(response, 200, { removed: true });
+          }
+          await rooms.changePassword(
+            room,
+            input?.password,
+            () =>
+              authenticate(request) === session &&
+              room.ownerId === session.identity.id,
+          );
+          revokeRoom(
+            room,
+            "password-changed",
+            (entry) => entry.identity.id !== room.ownerId,
+          );
+          for (const client of clients)
+            if (client.session.room === room)
+              send(
+                client.response,
+                "room-updated",
+                sessionRoomInfo(client.session),
+              );
+          return json(response, 200, { room: sessionRoomInfo(session) });
+        }
         if (url.pathname === "/api/uploads") {
           const session = authenticate(request);
           if (!session)
@@ -431,6 +549,8 @@ export function createChatServer(
           let result;
           try {
             result = issueSession(name, room.name, session);
+            room.ownerId = result.user.id;
+            result.room = sessionRoomInfo(sessions.get(result.token));
           } catch (error) {
             rooms.rooms.delete(room.name);
             throw error;
@@ -468,8 +588,17 @@ export function createChatServer(
               error: "That room closed. Choose it again from the list.",
             });
           const existing = authenticate(request, undefined, false);
+          if (original && existing !== original)
+            return json(response, 401, {
+              error: "Room access ended. Join again.",
+            });
+          const revision = room.revision;
           // Renaming within the same room may reuse its existing session grant.
-          if (room.hash && existing?.roomName !== roomName) {
+          if (
+            room.hash &&
+            existing?.room !== room &&
+            existing?.identity.id !== room.ownerId
+          ) {
             throttle(roomAttempts, request.socket.remoteAddress, 10);
             if (!(await rooms.verify(room, input?.password)))
               return json(response, 403, { error: "Incorrect room password." });
@@ -477,6 +606,14 @@ export function createChatServer(
           if (rooms.get(roomName) !== room)
             return json(response, 404, {
               error: "Room expired. Choose another room.",
+            });
+          if (room.revision !== revision)
+            return json(response, 409, {
+              error: "Room access changed. Try joining again.",
+            });
+          if (existing && authenticate(request, undefined, false) !== existing)
+            return json(response, 401, {
+              error: "Room access ended. Join again.",
             });
           return json(response, 201, issueSession(name, roomName, existing));
         }
@@ -694,7 +831,7 @@ export function createChatServer(
           return json(response, 401, { error: "Please join the chat again." });
         return json(response, 200, {
           user: { id: session.identity.id, name: session.identity.name },
-          room: roomInfo(rooms.get(session.roomName)),
+          room: sessionRoomInfo(session),
         });
       }
       if (request.method === "GET" && url.pathname === "/api/events") {
@@ -716,7 +853,7 @@ export function createChatServer(
         send(response, "ready", {
           user: { id: session.identity.id, name: session.identity.name },
           messages: rooms.get(session.roomName).messages,
-          room: roomInfo(rooms.get(session.roomName)),
+          room: sessionRoomInfo(session),
           users: online(session.roomName),
           fileLimits: attachments.limits,
         });

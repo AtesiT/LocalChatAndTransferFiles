@@ -802,3 +802,54 @@ dialog button {
     padding-right: 42px;
   }
 }
+
+#manage-button {
+  color: var(--green);
+  flex-shrink: 0;
+}
+#manage-dialog h3 {
+  margin: 18px 0 6px;
+  font-size: 13px;
+  color: var(--muted);
+  font-weight: normal;
+}
+#manage-dialog input {
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 6px;
+}
+#manage-dialog input:focus {
+  border-color: var(--green);
+}
+#manage-members {
+  list-style: none;
+  padding: 0;
+  margin: 6px 0;
+  max-height: 180px;
+  overflow: auto;
+  color: var(--muted);
+}
+#manage-members li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: baseline;
+}
+#manage-members li span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+#manage-members button {
+  flex-shrink: 0;
+}
+#delete-room-button {
+  color: #e4a18a;
+}
+#manage-status {
+  color: var(--green);
+  font-size: 12px;
+}
+@media (max-width: 640px) {
+  #manage-button {
+    font-size: 11px;
+  }
+}

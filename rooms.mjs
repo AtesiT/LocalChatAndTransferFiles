@@ -60,7 +60,14 @@ export class RoomStore {
     try {
       const salt = password ? randomBytes(16) : null;
       const hash = password ? await this.hash(password, salt) : null;
-      const room = { id: randomUUID(), name, salt, hash, messages: [] };
+      const room = {
+        id: randomUUID(),
+        name,
+        salt,
+        hash,
+        messages: [],
+        revision: 0,
+      };
       this.rooms.set(name, room);
       return room;
     } finally {
@@ -68,10 +75,28 @@ export class RoomStore {
     }
   }
 
+  async changePassword(room, password, authorize = () => true) {
+    this.validatePassword(password);
+    if (this.get(room.name) !== room) throw fail("Room no longer exists.", 404);
+    const revision = room.revision;
+    const salt = password ? randomBytes(16) : null;
+    const hash = password ? await this.hash(password, salt) : null;
+    if (!authorize()) throw fail("Room access ended. Please join again.", 401);
+    if (this.get(room.name) !== room) throw fail("Room no longer exists.", 404);
+    if (room.revision !== revision)
+      throw fail("Room access changed. Try again.", 409);
+    room.salt = salt;
+    room.hash = hash;
+    room.revision++;
+  }
+
   async verify(room, password = "") {
     this.validatePassword(password);
-    if (!room.hash) return true;
-    const candidate = await this.hash(password, room.salt);
-    return timingSafeEqual(candidate, room.hash);
+    const { salt, hash, revision } = room;
+    if (!hash) return true;
+    const candidate = await this.hash(password, salt);
+    if (this.get(room.name) !== room || room.revision !== revision)
+      throw fail("Room access changed. Try joining again.", 409);
+    return timingSafeEqual(candidate, hash);
   }
 }

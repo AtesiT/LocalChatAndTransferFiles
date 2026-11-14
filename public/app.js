@@ -29,10 +29,13 @@ let catalogStream = null;
 let selectedEntryRoom = null;
 let currentRoom = { name: "general", protected: false };
 let roomBusy = false;
+let managing = false;
+let roomPeople = [];
 const drafts = new Map();
 const createDialog = $("#create-dialog");
 const settingsDialog = $("#settings-dialog");
 const renameDialog = $("#rename-dialog");
+const manageDialog = $("#manage-dialog");
 let maxFileSize = 25 * 1024 * 1024;
 let maxFilesPerMessage = 10;
 let queue = makeQueue();
@@ -160,6 +163,9 @@ function updateComposer() {
   $("#character-count").textContent =
     length > 1600 ? `${length.toLocaleString()} / 2,000` : "";
   $("#character-count").classList.toggle("over", length > 2000);
+  $("#manage-button").hidden = !connected || !currentRoom.isOwner;
+  $("#manage-button").disabled =
+    !connected || sending || roomBusy || loggingOut;
   $("#search-button").disabled = !connected || loggingOut;
   updateReply();
   input.style.height = "auto";
@@ -250,6 +256,8 @@ function appendMessageText(container, message) {
   container.append(document.createTextNode(message.text.slice(offset)));
 }
 function renderPeople(users) {
+  roomPeople = users;
+  renderManageMembers();
   $("#people-count").textContent = users.length;
   updateRoomTitle(users.length);
   $("#no-people").hidden = users.length > 0;
@@ -350,7 +358,8 @@ async function api(path, data, auth = false) {
         ? identityToken || token
         : token || identityToken;
   const response = await fetch(path, {
-    ...(["/api/messages", "/api/logout"].includes(path)
+    ...(["/api/messages", "/api/logout"].includes(path) ||
+    /^\/api\/rooms\/.+\/(password|kick|delete)$/.test(path)
       ? { signal: AbortSignal.timeout(15000) }
       : {}),
     method: "POST",
@@ -376,6 +385,7 @@ async function api(path, data, auth = false) {
 }
 function setRoom(room) {
   if (currentRoom.id !== room.id) {
+    manageDialog.close();
     unread.reset(room.name);
     closeSearch();
     resetDrag();
@@ -462,6 +472,14 @@ function connect() {
   stream.addEventListener("message", (event) => {
     if (stream === source) renderMessage(JSON.parse(event.data));
   });
+  stream.addEventListener("room-left", (event) => {
+    if (stream !== source) return;
+    const data = JSON.parse(event.data);
+    leaveRoom(data.roomId, data.reason);
+  });
+  stream.addEventListener("room-updated", (event) => {
+    if (stream === source) setRoom(JSON.parse(event.data));
+  });
   stream.addEventListener("logged-out", () => {
     if (stream === source) resetLogin();
   });
@@ -484,14 +502,7 @@ function connect() {
       });
       // Ignore a late check belonging to a connection already replaced.
       if (stream !== source) return;
-      if (response.status === 401) {
-        stream.close();
-        storage.remove("commonroom-token");
-        setConnection(false, "login required");
-        createDialog.close();
-        renameDialog.close();
-        openJoin();
-      }
+      if (response.status === 401) leaveRoom(currentRoom.id, "unavailable");
     } catch {
       /* The server is offline; let EventSource retry. */
     }
@@ -593,7 +604,7 @@ function startCatalog() {
 }
 function entryBusy(value) {
   roomBusy = value;
-  for (const root of [dialog, createDialog, renameDialog]) {
+  for (const root of [dialog, createDialog, renameDialog, manageDialog]) {
     for (const control of root.querySelectorAll("button, input"))
       control.disabled = value;
   }
@@ -616,6 +627,136 @@ function openJoin(roomsOnly = false) {
   if (!$("#room-step").hidden) $("#entry-room-list button")?.focus();
   else $("#name-input").focus();
 }
+function renderManageMembers() {
+  const list = $("#manage-members");
+  list.replaceChildren();
+  if (!currentRoom.isOwner) return;
+  for (const person of roomPeople) {
+    if (person.id === user?.id) continue;
+    const row = document.createElement("li");
+    const name = document.createElement("span");
+    name.textContent = person.name;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "[remove]";
+    remove.setAttribute("aria-label", `Remove ${person.name} from room`);
+    remove.disabled = managing || roomBusy || !connected;
+    remove.addEventListener("click", () =>
+      manageRoom("kick", { userId: person.id }),
+    );
+    row.append(name, remove);
+    list.append(row);
+  }
+  if (!list.children.length)
+    list.textContent = "(no other online participants)";
+}
+async function manageRoom(action, data) {
+  if (managing || roomBusy || sending || !connected || !currentRoom.isOwner)
+    return;
+  const epoch = authEpoch;
+  const roomId = currentRoom.id;
+  managing = true;
+  entryBusy(true);
+  renderManageMembers();
+  $("#manage-error").textContent = "";
+  $("#manage-status").textContent = "";
+  try {
+    const result = await api(`/api/rooms/${roomId}/${action}`, data, true);
+    if (action === "delete") {
+      leaveRoom(roomId, "deleted");
+      return;
+    }
+    if (result.room) setRoom(result.room);
+    $("#manage-status").textContent =
+      action === "kick"
+        ? "Participant removed from this room."
+        : "Password updated. Other participants must join again.";
+  } catch (error) {
+    if (epoch === authEpoch) $("#manage-error").textContent = error.message;
+  } finally {
+    if (epoch === authEpoch) {
+      managing = false;
+      entryBusy(false);
+      renderManageMembers();
+      $("#manage-password").value = "";
+    }
+  }
+}
+$("#manage-button").addEventListener("click", () => {
+  if (!connected || !currentRoom.isOwner || roomBusy || sending) return;
+  $("#manage-title").textContent = `localchat / manage #${currentRoom.name}`;
+  $("#manage-error").textContent = $("#manage-status").textContent = "";
+  $("#manage-password").value = $("#delete-room-confirm").value = "";
+  $("#delete-room-confirm").placeholder = currentRoom.name;
+  renderManageMembers();
+  // Leave a connection slot for management requests with several HTTP/1 chat tabs.
+  catalogStream?.close();
+  catalogStream = null;
+  manageDialog.showModal();
+});
+$("#manage-close").addEventListener("click", () => manageDialog.close());
+manageDialog.addEventListener("cancel", (event) => {
+  if (managing) event.preventDefault();
+});
+manageDialog.addEventListener("close", () => {
+  $("#manage-password").value = $("#delete-room-confirm").value = "";
+  if (!catalogStream && !loggingOut) startCatalog();
+});
+$("#save-room-password").addEventListener("click", () =>
+  manageRoom("password", { password: $("#manage-password").value }),
+);
+$("#delete-room-button").addEventListener("click", () =>
+  manageRoom("delete", { confirmName: $("#delete-room-confirm").value }),
+);
+function leaveRoom(roomId, reason) {
+  const draft = drafts.get(roomId);
+  draft?.queue.abandon();
+  drafts.delete(roomId);
+  if (currentRoom.id !== roomId) return;
+  authEpoch++;
+  stream?.close();
+  stream = null;
+  queue.abandon();
+  token = null;
+  sending = managing = false;
+  storage.remove("commonroom-token");
+  storage.remove("localchat-room");
+  input.value = fileInput.value = "";
+  queue = makeQueue();
+  pendingMessage = replyTarget = null;
+  roomMessages.clear();
+  seen = new Set();
+  closeSearch();
+  resetDrag();
+  currentRoom = { name: "general", protected: false };
+  unread.reset("general");
+  setRoom(currentRoom);
+  messages.querySelectorAll(".message").forEach((node) => node.remove());
+  $("#empty-state").hidden = false;
+  $("#new-messages").hidden = true;
+  $("#notice").hidden = true;
+  clearTimeout(noticeTimer);
+  renderPeople([]);
+  for (const modal of [
+    createDialog,
+    renameDialog,
+    settingsDialog,
+    manageDialog,
+  ])
+    modal.close();
+  entryBusy(false);
+  setConnection(false, "choose a room");
+  updateFile();
+  openJoin(true);
+  $("#join-error").textContent =
+    {
+      kicked: "You were removed from the room by its creator.",
+      "password-changed":
+        "The room password changed. Join again using the current password.",
+      deleted: "The room was deleted by its creator.",
+      expired: "The room closed because it was empty.",
+    }[reason] || "Room access ended. Choose a room to continue.";
+}
 function abandonDrafts() {
   for (const uploads of new Set([
     queue,
@@ -630,7 +771,7 @@ function resetLogin() {
   abandonDrafts();
   drafts.clear();
   token = identityToken = user = null;
-  loggingOut = sending = false;
+  loggingOut = sending = managing = false;
   for (const key of [
     "commonroom-token",
     "localchat-identity",
@@ -657,7 +798,12 @@ function resetLogin() {
   $("#notice").hidden = true;
   clearTimeout(noticeTimer);
   renderPeople([]);
-  for (const modal of [createDialog, renameDialog, settingsDialog])
+  for (const modal of [
+    createDialog,
+    renameDialog,
+    settingsDialog,
+    manageDialog,
+  ])
     modal.close();
   entryBusy(false);
   setConnection(false, "logged out");
