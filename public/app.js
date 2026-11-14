@@ -1,3 +1,4 @@
+import { UploadQueue, requestId } from "/uploads.js";
 import { NotificationAudio, SOUNDS } from "/notifications.js";
 const $ = (selector) => document.querySelector(selector);
 const dialog = $("#join-dialog");
@@ -21,75 +22,71 @@ const drafts = new Map();
 const createDialog = $("#create-dialog");
 const settingsDialog = $("#settings-dialog");
 const renameDialog = $("#rename-dialog");
-let selectedFile = null;
-let uploadedAttachment = null;
-let uploadRequest = null;
 let maxFileSize = 25 * 1024 * 1024;
+let maxFilesPerMessage = 10;
+let queue = makeQueue();
+let pendingMessage = null;
 const fileInput = $("#file-input");
 const formatSize = (bytes) => {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 };
+function makeQueue() {
+  return new UploadQueue({
+    credential: () => token,
+    change: () => {
+      updateFile();
+      updateComposer();
+    },
+  });
+}
 function updateFile() {
-  $("#selected-file").hidden = !selectedFile;
-  $("#file-status").textContent = selectedFile
-    ? `[file] ${selectedFile.name} (${formatSize(selectedFile.size)})`
-    : "";
+  $("#selected-file").hidden = !queue.entries.length;
+  const total = queue.entries.reduce((sum, entry) => sum + entry.file.size, 0);
+  const loaded = queue.entries.reduce((sum, entry) => sum + entry.loaded, 0);
+  const percent = total
+    ? Math.floor((loaded / total) * 100)
+    : queue.entries.every((entry) => entry.state === "ready")
+      ? 100
+      : 0;
+  $("#file-status").textContent =
+    `[files] ${queue.entries.length}/${maxFilesPerMessage} / ${percent}% / ${formatSize(loaded)} of ${formatSize(total)}`;
+  $("#upload-progress").value = percent;
+  const list = $("#file-list");
+  // Keep cancel buttons stable while progress changes, including keyboard focus.
+  for (const node of [...list.children])
+    if (!queue.entries.some((entry) => entry.clientId === node.dataset.id))
+      node.remove();
+  for (const entry of queue.entries) {
+    let row = [...list.children].find(
+      (node) => node.dataset.id === entry.clientId,
+    );
+    if (!row) {
+      row = document.createElement("li");
+      row.dataset.id = entry.clientId;
+      row.append(document.createElement("span"));
+      const cancel = document.createElement("button");
+      cancel.type = "button";
+      cancel.textContent = "[cancel]";
+      cancel.setAttribute("aria-label", `Cancel ${entry.file.name}`);
+      cancel.addEventListener("click", () => queue.cancel(entry));
+      row.append(cancel);
+      list.append(row);
+    }
+    const progress = entry.file.size
+      ? Math.floor((entry.loaded / entry.file.size) * 100)
+      : entry.state === "ready"
+        ? 100
+        : 0;
+    row.firstChild.textContent = `${entry.file.name} (${formatSize(entry.file.size)}) / ${progress}% / ${entry.state}`;
+    row.lastChild.disabled = queue.locked;
+  }
 }
 function clearFile() {
-  selectedFile = null;
-  uploadedAttachment = null;
+  queue.entries = [];
   fileInput.value = "";
   updateFile();
-}
-function uploadFile(file) {
-  return new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    uploadRequest = xhr;
-    xhr.open("POST", "/api/files");
-    xhr.setRequestHeader("Authorization", `Bearer ${token}`);
-    xhr.setRequestHeader("Content-Type", "application/octet-stream");
-    xhr.setRequestHeader("X-File-Name", encodeURIComponent(file.name));
-    xhr.responseType = "json";
-    xhr.timeout = 120000;
-    const progress = (label) => {
-      $("#file-status").textContent =
-        `[file] ${file.name} (${formatSize(file.size)}) / ${label}`;
-    };
-    progress("uploading 0%");
-    xhr.upload.onprogress = (event) => {
-      if (event.lengthComputable)
-        progress(
-          `uploading ${Math.round((event.loaded / event.total) * 100)}%`,
-        );
-    };
-    xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300 && xhr.response?.attachment?.id)
-        resolve(xhr.response.attachment);
-      else
-        reject(
-          Object.assign(
-            new Error(
-              xhr.response?.error || "Upload failed. Please try again.",
-            ),
-            { status: xhr.status },
-          ),
-        );
-    };
-    xhr.onerror = () =>
-      reject(new Error("Upload failed. Check your connection and try again."));
-    xhr.ontimeout = () =>
-      reject(new Error("Upload timed out. Please try again."));
-    xhr.onabort = () =>
-      reject(new DOMException("Upload cancelled.", "AbortError"));
-    xhr.send(file);
-  }).finally(() => {
-    uploadRequest = null;
-    $("#remove-file").textContent = "[remove]";
-    updateFile();
-    updateComposer();
-  });
 }
 const storage = {
   get(key) {
@@ -141,12 +138,11 @@ function updateComposer() {
     !connected ||
     sending ||
     roomBusy ||
-    (!length && !selectedFile) ||
+    (!length && !queue.entries.length) ||
     length > 2000;
   $("#attach-button").disabled = !connected || sending;
   $("#identity").disabled = !connected || sending || roomBusy;
   $("#rooms-button").disabled = !connected || sending || roomBusy;
-  $("#remove-file").disabled = sending && !uploadRequest;
   $("#character-count").textContent =
     length > 1600 ? `${length.toLocaleString()} / 2,000` : "";
   $("#character-count").classList.toggle("over", length > 2000);
@@ -196,12 +192,13 @@ function renderMessage(message, history = false) {
   const text = document.createElement("div");
   text.className = "message-text";
   text.textContent = message.text;
-  if (message.attachment) {
+  for (const attachment of message.attachments ||
+    (message.attachment ? [message.attachment] : [])) {
     const link = document.createElement("a");
     link.className = "attachment";
-    link.href = `/api/files/${encodeURIComponent(message.attachment.id)}?token=${encodeURIComponent(token)}`;
-    link.download = message.attachment.name;
-    link.textContent = `[file] ${message.attachment.name} (${formatSize(message.attachment.size)}) ↓`;
+    link.href = `/api/files/${encodeURIComponent(attachment.id)}?token=${encodeURIComponent(token)}`;
+    link.download = attachment.name;
+    link.textContent = `[file] ${attachment.name} (${formatSize(attachment.size)}) ↓`;
     text.append(link);
   }
   article.append(time, name, text);
@@ -222,6 +219,7 @@ async function api(path, data, auth = false) {
         ? identityToken || token
         : token;
   const response = await fetch(path, {
+    ...(path === "/api/messages" ? { signal: AbortSignal.timeout(15000) } : {}),
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -244,11 +242,12 @@ async function api(path, data, auth = false) {
 function setRoom(room) {
   if (currentRoom.id !== room.id) {
     // A private-room draft must never silently become a public-room message.
-    drafts.set(currentRoom.id, { text: input.value, file: selectedFile });
+    drafts.set(currentRoom.id, { text: input.value, queue, pendingMessage });
     const draft = drafts.get(room.id);
     input.value = draft?.text || "";
-    selectedFile = draft?.file || null;
-    uploadedAttachment = null;
+    queue = draft?.queue || makeQueue();
+    queue.limit = maxFilesPerMessage;
+    pendingMessage = draft?.pendingMessage || null;
     fileInput.value = "";
     updateFile();
     messages.querySelectorAll(".message").forEach((node) => node.remove());
@@ -273,7 +272,6 @@ function acceptSession(result) {
   identityToken = result.identityToken;
   user = result.user;
   storage.set("localchat-identity", identityToken);
-  uploadedAttachment = null;
   storage.set("commonroom-token", token);
   storage.set("commonroom-name", user.name);
   $("#join-password").value = "";
@@ -294,8 +292,11 @@ function connect() {
     user = data.user;
     setRoom(data.room);
     maxFileSize = data.fileLimits.maxFileSize;
+    maxFilesPerMessage = data.fileLimits.maxFilesPerMessage || 10;
+    queue.limit = maxFilesPerMessage;
+    updateFile();
     $("#attach-button").title =
-      `Attach a file (max ${formatSize(maxFileSize)})`;
+      `Attach up to ${maxFilesPerMessage} files (max ${formatSize(maxFileSize)} each)`;
     $("#my-name").textContent = user.name;
     storage.set("commonroom-name", user.name);
     const wasNearBottom = nearBottom();
@@ -697,17 +698,36 @@ $("#message-form").addEventListener("submit", async (event) => {
   if ($("#send-button").disabled) return;
   const draft = input.value;
   const text = draft.trim();
+  const sendingQueue = queue;
+  const sendingRoom = currentRoom.id;
+  const sendingToken = token;
   sending = true;
   updateComposer();
   try {
-    if (selectedFile && !uploadedAttachment) {
-      $("#remove-file").textContent = "[cancel]";
-      $("#remove-file").disabled = false;
-      uploadedAttachment = await uploadFile(selectedFile);
-    }
-    const payload = { text };
-    if (uploadedAttachment) payload.attachmentId = uploadedAttachment.id;
-    const result = await api("/api/messages", payload, true);
+    const attachmentIds = await sendingQueue.uploadAll();
+    if (
+      currentRoom.id !== sendingRoom ||
+      queue !== sendingQueue ||
+      token !== sendingToken
+    )
+      throw new Error(
+        "Room session changed. Your original-room draft has been kept; send it again there.",
+      );
+    if (!text && !attachmentIds.length) return;
+    const signature = JSON.stringify({ text, attachmentIds });
+    if (pendingMessage?.signature !== signature)
+      pendingMessage = { signature, clientMessageId: requestId() };
+    // Publishing is atomic. Cancellation is only offered before the commit request.
+    queue.locked = true;
+    updateFile();
+    const result = await api(
+      "/api/messages",
+      { text, attachmentIds, clientMessageId: pendingMessage.clientMessageId },
+      true,
+    );
+    sendingQueue.entries = [];
+    if (currentRoom.id !== sendingRoom || queue !== sendingQueue) return;
+    pendingMessage = null;
     clearFile();
     clearTimeout(noticeTimer);
     $("#notice").hidden = true;
@@ -716,7 +736,6 @@ $("#message-form").addEventListener("submit", async (event) => {
     if (input.value === draft) input.value = "";
     scrollBottom();
   } catch (error) {
-    if (error.status === 400) uploadedAttachment = null;
     notice(
       error.name === "AbortError"
         ? "Upload cancelled."
@@ -731,33 +750,32 @@ $("#message-form").addEventListener("submit", async (event) => {
     }
   } finally {
     sending = false;
+    sendingQueue.locked = false;
+    updateFile();
     updateComposer();
     input.focus();
   }
 });
 $("#attach-button").addEventListener("click", () => fileInput.click());
 fileInput.addEventListener("change", () => {
-  const file = fileInput.files[0];
-  if (!file) return;
-  if (file.size > maxFileSize) {
-    notice(`File is too large. Maximum size: ${formatSize(maxFileSize)}.`);
-    fileInput.value = "";
-    return;
+  for (const file of fileInput.files) {
+    if (file.size > maxFileSize) {
+      notice(`File is too large. Maximum size: ${formatSize(maxFileSize)}.`);
+      continue;
+    }
+    if ([...file.name].length > 180) {
+      notice("File name is too long. Use up to 180 characters.");
+      continue;
+    }
+    try {
+      queue.add(file);
+    } catch (error) {
+      notice(error.message);
+      break;
+    }
   }
-  if ([...file.name].length > 180) {
-    notice("File name is too long. Use up to 180 characters.");
-    fileInput.value = "";
-    return;
-  }
-  selectedFile = file;
-  uploadedAttachment = null;
+  fileInput.value = "";
   updateFile();
-  updateComposer();
-  input.focus();
-});
-$("#remove-file").addEventListener("click", () => {
-  uploadRequest?.abort();
-  clearFile();
   updateComposer();
   input.focus();
 });

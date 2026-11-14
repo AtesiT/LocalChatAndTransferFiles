@@ -1123,3 +1123,338 @@ test("a connected participant keeps their nickname even before the next heartbea
     201,
   );
 });
+
+async function resumableApi(base, token, method, id, data, headers = {}) {
+  const response = await fetch(`${base}/api/uploads${id ? `/${id}` : ""}`, {
+    method,
+    headers: { Authorization: `Bearer ${token}`, ...headers },
+    ...(data !== undefined ? { body: data } : {}),
+  });
+  return { status: response.status, ...(await response.json()) };
+}
+const declare = (
+  base,
+  token,
+  name = "notes.txt",
+  size = 8,
+  clientId = "upload-request-123456",
+) =>
+  resumableApi(
+    base,
+    token,
+    "POST",
+    null,
+    JSON.stringify({ name, size, clientId }),
+    { "Content-Type": "application/json" },
+  );
+const appendChunk = (base, token, id, data, offset = 0, headers = {}) =>
+  resumableApi(base, token, "PATCH", id, data, {
+    "Content-Type": "application/octet-stream",
+    "Upload-Offset": String(offset),
+    ...headers,
+  });
+
+test("resumable upload API recovers lost responses, retains ownership across rename and publishes a batch once", async (t) => {
+  const { base, post } = await setup(t, { chunkSize: 4 });
+  const alice = await post("/api/session", { name: "Alice" });
+  const bob = await post("/api/session", { name: "Bob" });
+  const stream = await events(base, bob.token, t);
+  await stream.next("ready");
+  const first = await declare(base, alice.token);
+  assert.equal(first.status, 201);
+  const id = first.upload.id;
+  assert.equal(
+    (await appendChunk(base, alice.token, id, "abcd")).upload.offset,
+    4,
+  );
+  assert.equal((await appendChunk(base, alice.token, id, "abcd")).status, 409);
+  assert.equal((await declare(base, alice.token)).upload.id, id);
+  assert.equal(
+    (await resumableApi(base, alice.token, "GET", id)).upload.offset,
+    4,
+  );
+  assert.equal((await resumableApi(base, bob.token, "GET", id)).status, 404);
+  assert.equal((await appendChunk(base, bob.token, id, "efgh", 4)).status, 404);
+  const renamed = await post(
+    "/api/session",
+    { name: "Alice2", room: "general" },
+    alice.token,
+  );
+  assert.equal(
+    (await appendChunk(base, renamed.token, id, "efgh", 4)).upload.complete,
+    true,
+  );
+  assert.equal(
+    (await resumableApi(base, renamed.token, "GET", id)).upload.offset,
+    8,
+  );
+  const empty = await declare(
+    base,
+    renamed.token,
+    "empty.txt",
+    0,
+    "empty-request-123456",
+  );
+  assert.equal(empty.upload.complete, true);
+  const payload = {
+    text: "two files",
+    attachmentIds: [id, empty.upload.id],
+    clientMessageId: "message-request-123456",
+  };
+  const published = await post("/api/messages", payload, renamed.token);
+  assert.equal(published.status, 201);
+  assert.equal(published.message.attachments.length, 2);
+  assert.deepEqual(
+    (await stream.next("message")).attachments,
+    published.message.attachments,
+  );
+  assert.equal(
+    (await post("/api/messages", payload, renamed.token)).message.id,
+    published.message.id,
+  );
+  assert.equal(
+    (
+      await post(
+        "/api/messages",
+        { ...payload, text: "changed" },
+        renamed.token,
+      )
+    ).status,
+    409,
+  );
+  const download = await fetch(`${base}/api/files/${id}`, {
+    headers: { Authorization: `Bearer ${bob.token}` },
+  });
+  assert.equal(await download.text(), "abcdefgh");
+  assert.equal(
+    (await resumableApi(base, renamed.token, "DELETE", id)).status,
+    409,
+  );
+});
+
+test("upload cancellation is owner-only, frees capacity and rejects cross-origin writes", async (t) => {
+  const { base, post } = await setup(t, { maxStorageSize: 8, chunkSize: 4 });
+  const alice = await post("/api/session", { name: "Alice" });
+  const bob = await post("/api/session", { name: "Bob" });
+  const { upload } = await declare(base, alice.token);
+  assert.equal(
+    (
+      await appendChunk(base, alice.token, upload.id, "abcd", 0, {
+        Origin: "https://evil.example",
+      })
+    ).status,
+    403,
+  );
+  assert.equal(
+    (
+      await resumableApi(base, alice.token, "DELETE", upload.id, undefined, {
+        Origin: "https://evil.example",
+      })
+    ).status,
+    403,
+  );
+  assert.equal(
+    (await resumableApi(base, bob.token, "DELETE", upload.id)).status,
+    404,
+  );
+  assert.equal((await declare(base, bob.token, "b.txt", 1)).status, 507);
+  assert.equal(
+    (await appendChunk(base, alice.token, upload.id, "abcd")).status,
+    200,
+  );
+  assert.equal(
+    (await resumableApi(base, alice.token, "DELETE", upload.id)).status,
+    200,
+  );
+  assert.equal(
+    (await resumableApi(base, alice.token, "GET", upload.id)).status,
+    404,
+  );
+  assert.equal((await declare(base, bob.token)).status, 201);
+});
+
+test("batch publication validates every attachment atomically, count, duplicates and room grants", async (t) => {
+  const { base, post } = await setup(t, { maxFilesPerMessage: 2 });
+  const alice = await post("/api/session", { name: "Alice" });
+  const otherRoom = await post(
+    "/api/rooms",
+    { name: "private", nickname: "Alice" },
+    alice.token,
+  );
+  const bob = await post("/api/session", { name: "Bob" });
+  const { upload } = await declare(base, alice.token, "empty", 0);
+  const { upload: secret } = await declare(base, otherRoom.token, "secret", 0);
+  assert.equal(
+    (await resumableApi(base, otherRoom.token, "GET", upload.id)).status,
+    404,
+  );
+  assert.equal(
+    (await post("/api/messages", { attachmentIds: [upload.id] }, bob.token))
+      .status,
+    400,
+  );
+  for (const ids of [
+    [upload.id, "missing"],
+    [upload.id, upload.id],
+    [upload.id, secret.id],
+    ["a", "b", "c"],
+    "wrong",
+    [null],
+  ]) {
+    assert.equal(
+      (await post("/api/messages", { attachmentIds: ids }, alice.token)).status,
+      400,
+    );
+  }
+  assert.equal(
+    (
+      await post(
+        "/api/messages",
+        { attachmentId: upload.id, attachmentIds: [] },
+        alice.token,
+      )
+    ).status,
+    400,
+  );
+  const published = await post(
+    "/api/messages",
+    { attachmentIds: [upload.id] },
+    alice.token,
+  );
+  assert.equal(
+    published.status,
+    201,
+    "invalid batches never consume a valid attachment",
+  );
+  assert.equal(published.message.attachments[0].size, 0);
+});
+
+test("batch attachment history eviction removes every file", async (t) => {
+  const { base, post } = await setup(t);
+  const alice = await post("/api/session", { name: "Alice" });
+  const ids = [];
+  for (let i = 0; i < 3; i++)
+    ids.push(
+      (
+        await declare(
+          base,
+          alice.token,
+          `${i}.txt`,
+          0,
+          `file-request-123456-${i}`,
+        )
+      ).upload.id,
+    );
+  await post("/api/messages", { attachmentIds: ids }, alice.token);
+  // Rate limits apply per grant; the same identity may reconnect without losing ownership.
+  for (let i = 0; i < 10; i++) {
+    const session = await post(
+      "/api/session",
+      { name: "Alice", room: "general" },
+      alice.token,
+    );
+    for (let j = 0; j < 10; j++)
+      assert.equal(
+        (await post("/api/messages", { text: `${i}-${j}` }, session.token))
+          .status,
+        201,
+      );
+  }
+  for (const id of ids) {
+    const response = await fetch(`${base}/api/files/${id}`, {
+      headers: { Authorization: `Bearer ${alice.token}` },
+    });
+    assert.equal(response.status, 404);
+    assert.equal(
+      (await resumableApi(base, alice.token, "GET", id)).status,
+      404,
+    );
+  }
+});
+
+test("deleting a room during a chunk releases its reservation and never revives the old generation", async (t) => {
+  const { base, post } = await setup(
+    t,
+    { maxFileSize: 8, maxStorageSize: 8 },
+    { roomGraceMs: 100 },
+  );
+  const catalog = await events(base, null, t, "/api/rooms/events");
+  await catalog.next("rooms");
+  const created = await post("/api/rooms", {
+    name: "chunk-race",
+    nickname: "Alice",
+  });
+  const { upload: pending } = await declare(base, created.token);
+  let request;
+  const completed = new Promise((resolve, reject) => {
+    request = http.request(
+      `${base}/api/uploads/${pending.id}`,
+      {
+        method: "PATCH",
+        headers: {
+          Authorization: `Bearer ${created.token}`,
+          "Content-Type": "application/octet-stream",
+          "Upload-Offset": "0",
+          "Content-Length": "8",
+        },
+      },
+      (response) => {
+        response.resume();
+        response.on("end", () => resolve(response.statusCode));
+      },
+    );
+    request.on("error", reject);
+    request.write("abcd");
+  });
+  let snapshot;
+  do {
+    snapshot = await catalog.next("rooms");
+  } while (snapshot.rooms.some((room) => room.id === created.room.id));
+  request.end("efgh");
+  assert.equal(await completed, 404);
+  const replacement = await post("/api/rooms", {
+    name: "chunk-race",
+    nickname: "Bob",
+  });
+  assert.notEqual(replacement.room.id, created.room.id);
+  assert.equal((await declare(base, replacement.token)).status, 201);
+  assert.equal(
+    (await resumableApi(base, replacement.token, "GET", pending.id)).status,
+    404,
+  );
+});
+
+test("retrying upload creation does not consume the new-upload throttle", async (t) => {
+  const { base, post } = await setup(t);
+  const alice = await post("/api/session", { name: "Alice" });
+  let id;
+  for (let i = 0; i < 35; i++) {
+    const response = await declare(base, alice.token, "empty.txt", 0);
+    assert.equal(response.status, 201);
+    id ||= response.upload.id;
+    assert.equal(response.upload.id, id);
+  }
+  for (let i = 1; i < 30; i++)
+    assert.equal(
+      (
+        await declare(
+          base,
+          alice.token,
+          "empty.txt",
+          0,
+          `different-request-${i}`,
+        )
+      ).status,
+      201,
+    );
+  assert.equal(
+    (await declare(base, alice.token, "empty.txt", 0, "one-too-many-123456"))
+      .status,
+    429,
+  );
+  assert.equal((await declare(base, alice.token, "empty.txt", 0)).status, 201);
+  assert.equal(
+    (await declare(base, alice.identityToken, "empty.txt", 0)).status,
+    401,
+  );
+});

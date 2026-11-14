@@ -54,9 +54,13 @@
         <div id="notice" class="notice" role="status" hidden></div>
         <div id="selected-file" class="selected-file" hidden>
           <span id="file-status" role="status"></span>
-          <button id="remove-file" type="button" aria-label="Remove attachment">
-            [remove]
-          </button>
+          <progress
+            id="upload-progress"
+            max="100"
+            value="0"
+            aria-label="Overall upload progress"
+          ></progress>
+          <ul id="file-list" aria-label="Attachments"></ul>
         </div>
         <form id="message-form" class="command-line">
           <div class="prompt">
@@ -79,13 +83,13 @@
             disabled
             spellcheck="false"
           ></textarea>
-          <input id="file-input" type="file" hidden />
+          <input id="file-input" type="file" multiple hidden />
           <button
             id="attach-button"
             class="send"
             type="button"
             disabled
-            aria-label="Attach a file"
+            aria-label="Attach files"
           >
             [attach]
           </button>

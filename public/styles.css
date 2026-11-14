@@ -484,9 +484,8 @@ dialog button {
   outline-offset: 2px;
 }
 .selected-file {
-  display: flex;
-  gap: 12px;
-  align-items: baseline;
+  display: grid;
+  gap: 6px;
   padding: 0 0 8px;
   font-size: 12px;
 }
@@ -495,7 +494,7 @@ dialog button {
   overflow-wrap: anywhere;
   color: var(--cyan);
 }
-#remove-file {
+#file-list button {
   flex-shrink: 0;
   color: #d9b780;
 }
@@ -642,4 +641,28 @@ dialog button {
 }
 #room-step > .room-help {
   margin-bottom: 12px;
+}
+
+#file-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 160px;
+  overflow-y: auto;
+}
+#file-list li {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 3px 0;
+}
+#file-list li span {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+#upload-progress {
+  width: 100%;
+  height: 5px;
+  accent-color: var(--green);
 }
