@@ -26,7 +26,7 @@ async function setup(t, limits, options) {
     server.closeAllConnections();
     if (server.listening) await once(server, "close");
   });
-  return { base, post };
+  return { base, post, server };
 }
 
 async function events(base, token, t, path = `/api/events?token=${token}`) {
@@ -1457,4 +1457,135 @@ test("retrying upload creation does not consume the new-upload throttle", async 
     (await declare(base, alice.identityToken, "empty.txt", 0)).status,
     401,
   );
+});
+
+test("explicit logout immediately frees the nickname, revokes every grant, closes streams and updates counts", async (t) => {
+  const { base, post } = await setup(t);
+  const alice = await post("/api/session", { name: "Alice" });
+  const bob = await post("/api/session", { name: "Bob" });
+  const privateRoom = await post(
+    "/api/rooms",
+    { name: "logout-room" },
+    alice.token,
+  );
+  const general = await events(base, alice.token, t);
+  const duplicate = await events(base, alice.token, t);
+  const privateStream = await events(base, privateRoom.token, t);
+  for (const stream of [general, duplicate, privateStream])
+    await stream.next("ready");
+  const watcher = await events(base, bob.token, t);
+  await watcher.next("ready");
+  await watcher.next("presence");
+  assert.equal(
+    (
+      await post("/api/logout", {}, alice.token, {
+        Origin: "https://evil.example",
+      })
+    ).status,
+    403,
+  );
+  assert.equal((await post("/api/logout", {})).status, 401);
+  assert.equal(
+    (await post("/api/logout", {}, alice.identityToken)).status,
+    200,
+  );
+  for (const stream of [general, duplicate, privateStream])
+    assert.deepEqual(await stream.next("logged-out"), {});
+  const presence = await watcher.next("presence");
+  assert.deepEqual(
+    presence.map((person) => person.name),
+    ["Bob"],
+  );
+  const catalog = await (await fetch(base + "/api/rooms")).json();
+  assert.equal(catalog.rooms.find((room) => room.name === "general").count, 1);
+  assert.equal(
+    catalog.rooms.find((room) => room.name === "logout-room").count,
+    0,
+  );
+  for (const token of [alice.token, privateRoom.token, alice.identityToken]) {
+    assert.equal(
+      (
+        await fetch(base + "/api/nickname", {
+          headers: { Authorization: `Bearer ${token}` },
+        })
+      ).status,
+      401,
+    );
+    assert.equal(
+      (await post("/api/messages", { text: "revoked" }, token)).status,
+      401,
+    );
+    assert.equal(
+      (await fetch(base + `/api/events?token=${token}`)).status,
+      401,
+    );
+  }
+  const replacement = await post("/api/nickname", { name: "ALICE" });
+  assert.equal(replacement.status, 201);
+  assert.notEqual(replacement.user.id, alice.user.id);
+  assert.equal((await post("/api/logout", {}, alice.token)).status, 401);
+  assert.equal(
+    (await post("/api/logout", {}, replacement.identityToken)).status,
+    200,
+    "roomless nickname can also be released",
+  );
+});
+
+test("logout frees unpublished upload capacity but preserves published attachments for others", async (t) => {
+  const { base, post } = await setup(t, { maxStorageSize: 12 });
+  const alice = await post("/api/session", { name: "Alice" });
+  const bob = await post("/api/session", { name: "Bob" });
+  const published = await upload(base, alice.token, "shared.txt", "keep");
+  await post(
+    "/api/messages",
+    { attachmentId: published.attachment.id },
+    alice.token,
+  );
+  const pending = await declare(base, alice.token, "pending", 6);
+  const legacy = await upload(base, alice.token, "legacy", "xx");
+  assert.equal(legacy.status, 201);
+  assert.equal((await declare(base, bob.token, "full", 1)).status, 507);
+  assert.equal((await post("/api/logout", {}, alice.token)).status, 200);
+  assert.equal((await declare(base, bob.token, "free", 8)).status, 201);
+  assert.equal(
+    (await resumableApi(base, alice.token, "GET", pending.upload.id)).status,
+    401,
+  );
+  const download = await fetch(`${base}/api/files/${published.attachment.id}`, {
+    headers: { Authorization: `Bearer ${bob.token}` },
+  });
+  assert.equal(download.status, 200);
+  assert.equal(await download.text(), "keep");
+});
+
+test("an authenticated request waiting for its body cannot reclaim a nickname after logout", async (t) => {
+  const { base, post, server } = await setup(t);
+  const alice = await post("/api/session", { name: "Alice" });
+  const arrived = once(server, "request");
+  let request;
+  const completed = new Promise((resolve, reject) => {
+    request = http.request(
+      base + "/api/session",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${alice.token}`,
+          "Content-Type": "application/json",
+        },
+      },
+      (response) => {
+        response.resume();
+        response.on("end", () => resolve(response.statusCode));
+      },
+    );
+    request.on("error", reject);
+    request.write('{"name":"Alice",');
+  });
+  // Wait until the server has authenticated the headers and is reading the body.
+  await arrived;
+  await new Promise((resolve) => request.write('"room":', resolve));
+  assert.equal((await post("/api/logout", {}, alice.token)).status, 200);
+  request.end('"general"}');
+  assert.equal(await completed, 401);
+  assert.equal((await post("/api/nickname", { name: "Alice" })).status, 201);
 });

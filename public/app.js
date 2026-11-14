@@ -1,3 +1,4 @@
+import { TabUnread } from "/unread.js";
 import { UploadQueue, requestId } from "/uploads.js";
 import { NotificationAudio, SOUNDS } from "/notifications.js";
 const $ = (selector) => document.querySelector(selector);
@@ -10,6 +11,12 @@ let identityToken = null;
 let stream = null;
 let connected = false;
 let sending = false;
+let loggingOut = false;
+let authEpoch = 0;
+const tabActive = () => !document.hidden && document.hasFocus();
+const unread = new TabUnread((title) => {
+  document.title = title;
+});
 let noticeTimer;
 let seen = new Set();
 const audio = new NotificationAudio();
@@ -136,13 +143,16 @@ function updateComposer() {
   const length = [...input.value.trim()].length;
   $("#send-button").disabled =
     !connected ||
+    loggingOut ||
     sending ||
     roomBusy ||
     (!length && !queue.entries.length) ||
     length > 2000;
-  $("#attach-button").disabled = !connected || sending;
-  $("#identity").disabled = !connected || sending || roomBusy;
-  $("#rooms-button").disabled = !connected || sending || roomBusy;
+  $("#logout-button").hidden = !user;
+  $("#logout-button").disabled = loggingOut || roomBusy;
+  $("#attach-button").disabled = !connected || sending || loggingOut;
+  $("#identity").disabled = !connected || sending || roomBusy || loggingOut;
+  $("#rooms-button").disabled = !connected || sending || roomBusy || loggingOut;
   $("#character-count").textContent =
     length > 1600 ? `${length.toLocaleString()} / 2,000` : "";
   $("#character-count").classList.toggle("over", length > 2000);
@@ -169,6 +179,7 @@ function renderPeople(users) {
 }
 function renderMessage(message, history = false) {
   if (seen.has(message.id)) return;
+  if (!history) unread.receive(message, user?.id, tabActive());
   if (!history && message.userId !== user?.id) audio.play();
   seen.add(message.id);
   const shouldScroll = nearBottom() || message.userId === user?.id;
@@ -212,14 +223,17 @@ function renderMessage(message, history = false) {
   else if (!history) $("#new-messages").hidden = false;
 }
 async function api(path, data, auth = false) {
+  const epoch = authEpoch;
   const credential =
     path === "/api/session" && connected
       ? token
       : ["/api/nickname", "/api/session", "/api/rooms"].includes(path)
         ? identityToken || token
-        : token;
+        : token || identityToken;
   const response = await fetch(path, {
-    ...(path === "/api/messages" ? { signal: AbortSignal.timeout(15000) } : {}),
+    ...(["/api/messages", "/api/logout"].includes(path)
+      ? { signal: AbortSignal.timeout(15000) }
+      : {}),
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -232,6 +246,8 @@ async function api(path, data, auth = false) {
     body: JSON.stringify(data),
   });
   const result = await response.json();
+  if (epoch !== authEpoch)
+    throw new DOMException("Session changed.", "AbortError");
   if (!response.ok)
     throw Object.assign(new Error(result.error || "Please try again."), {
       status: response.status,
@@ -241,6 +257,7 @@ async function api(path, data, auth = false) {
 }
 function setRoom(room) {
   if (currentRoom.id !== room.id) {
+    unread.reset(room.name);
     // A private-room draft must never silently become a public-room message.
     drafts.set(currentRoom.id, { text: input.value, queue, pendingMessage });
     const draft = drafts.get(room.id);
@@ -263,7 +280,7 @@ function setRoom(room) {
   $("#prompt-room").textContent = `@${room.name}`;
   $("#empty-room").textContent = `#${room.name}`;
   $("#message-input").labels[0].textContent = `Message #${room.name}`;
-  document.title = `localchat / #${room.name}`;
+  document.title = unread.title;
   updateComposer();
 }
 function acceptSession(result) {
@@ -304,6 +321,7 @@ function connect() {
     messages.querySelectorAll(".message").forEach((node) => node.remove());
     seen = new Set();
     $("#empty-state").hidden = data.messages.length > 0;
+    unread.snapshot(data.messages, user.id, tabActive());
     for (const message of data.messages) renderMessage(message, true);
     renderPeople(data.users);
     setConnection(true, "connected");
@@ -314,6 +332,9 @@ function connect() {
   });
   stream.addEventListener("message", (event) => {
     if (stream === source) renderMessage(JSON.parse(event.data));
+  });
+  stream.addEventListener("logged-out", () => {
+    if (stream === source) resetLogin();
   });
   stream.addEventListener("profile", (event) => {
     if (stream !== source) return;
@@ -465,6 +486,86 @@ function openJoin(roomsOnly = false) {
   if (!dialog.open) dialog.showModal();
   if (!$("#room-step").hidden) $("#entry-room-list button")?.focus();
   else $("#name-input").focus();
+}
+function abandonDrafts() {
+  for (const uploads of new Set([
+    queue,
+    ...[...drafts.values()].map((draft) => draft.queue),
+  ]))
+    uploads.abandon();
+}
+function resetLogin() {
+  authEpoch++;
+  stream?.close();
+  stream = null;
+  abandonDrafts();
+  drafts.clear();
+  token = identityToken = user = null;
+  loggingOut = sending = false;
+  for (const key of [
+    "commonroom-token",
+    "localchat-identity",
+    "commonroom-name",
+    "localchat-room",
+  ])
+    storage.remove(key);
+  input.value = "";
+  fileInput.value = "";
+  queue = makeQueue();
+  pendingMessage = null;
+  currentRoom = { name: "general", protected: false };
+  unread.reset("general");
+  setRoom(currentRoom);
+  messages.querySelectorAll(".message").forEach((node) => node.remove());
+  seen = new Set();
+  $("#empty-state").hidden = false;
+  $("#new-messages").hidden = true;
+  $("#my-name").textContent = "guest";
+  $("#notice").hidden = true;
+  clearTimeout(noticeTimer);
+  renderPeople([]);
+  for (const modal of [createDialog, renameDialog, settingsDialog])
+    modal.close();
+  entryBusy(false);
+  setConnection(false, "logged out");
+  updateFile();
+  openJoin();
+  if (!catalogStream) startCatalog();
+}
+$("#logout-button").addEventListener("click", async () => {
+  if (loggingOut || roomBusy || !user) return;
+  const epoch = authEpoch;
+  loggingOut = true;
+  // Free HTTP/1 connection slots before POST, even with several chat tabs open.
+  stream?.close();
+  stream = null;
+  catalogStream?.close();
+  catalogStream = null;
+  abandonDrafts();
+  updateComposer();
+  try {
+    await api("/api/logout", {}, true);
+    resetLogin();
+  } catch (error) {
+    if (authEpoch !== epoch) return; // SSE may confirm logout before the HTTP reply.
+    if (error.status === 401) resetLogin();
+    else
+      notice(
+        "Could not confirm logout. Reconnect and try again; your nickname may still be reserved.",
+      );
+  } finally {
+    if (authEpoch === epoch) {
+      loggingOut = false;
+      if (!catalogStream) startCatalog();
+      if (token && !stream) connect();
+      updateComposer();
+    }
+  }
+});
+for (const event of ["visibilitychange", "focus"]) {
+  (event === "focus" ? window : document).addEventListener(event, () =>
+    unread.read(tabActive()),
+  );
 }
 $("#rooms-button").addEventListener("click", () => openJoin(true));
 $("#entry-close").addEventListener("click", () => dialog.close());
@@ -698,6 +799,7 @@ $("#message-form").addEventListener("submit", async (event) => {
   if ($("#send-button").disabled) return;
   const draft = input.value;
   const text = draft.trim();
+  const sendingEpoch = authEpoch;
   const sendingQueue = queue;
   const sendingRoom = currentRoom.id;
   const sendingToken = token;
@@ -705,6 +807,7 @@ $("#message-form").addEventListener("submit", async (event) => {
   updateComposer();
   try {
     const attachmentIds = await sendingQueue.uploadAll();
+    if (sendingEpoch !== authEpoch || loggingOut) return;
     if (
       currentRoom.id !== sendingRoom ||
       queue !== sendingQueue ||
@@ -736,6 +839,7 @@ $("#message-form").addEventListener("submit", async (event) => {
     if (input.value === draft) input.value = "";
     scrollBottom();
   } catch (error) {
+    if (sendingEpoch !== authEpoch || loggingOut) return;
     notice(
       error.name === "AbortError"
         ? "Upload cancelled."
@@ -749,11 +853,13 @@ $("#message-form").addEventListener("submit", async (event) => {
       openJoin();
     }
   } finally {
-    sending = false;
     sendingQueue.locked = false;
-    updateFile();
-    updateComposer();
-    input.focus();
+    if (sendingEpoch === authEpoch) {
+      sending = false;
+      updateFile();
+      updateComposer();
+      if (!loggingOut) input.focus();
+    }
   }
 });
 $("#attach-button").addEventListener("click", () => fileInput.click());

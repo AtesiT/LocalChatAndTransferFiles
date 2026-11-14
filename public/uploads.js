@@ -56,6 +56,15 @@ export class UploadQueue {
     }
   }
 
+  abandon() {
+    for (const entry of this.entries) {
+      entry.cancelled = true;
+      entry.xhr?.abort();
+    }
+    this.entries = [];
+    this.change();
+  }
+
   cancel(entry) {
     if (this.locked) return;
     entry.cancelled = true;

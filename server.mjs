@@ -13,6 +13,7 @@ const SESSION_TTL = 24 * 60 * 60 * 1000;
 const files = new Map([
   ["/", ["index.html", "text/html; charset=utf-8"]],
   ["/app.js", ["app.js", "text/javascript; charset=utf-8"]],
+  ["/unread.js", ["unread.js", "text/javascript; charset=utf-8"]],
   ["/uploads.js", ["uploads.js", "text/javascript; charset=utf-8"]],
   ["/notifications.js", ["notifications.js", "text/javascript; charset=utf-8"]],
   ["/styles.css", ["styles.css", "text/css; charset=utf-8"]],
@@ -78,6 +79,16 @@ export function createChatServer(
     timer.unref();
     emptyTimers.set(room.name, timer);
   };
+  const disconnect = (client) => {
+    if (!clients.delete(client)) return;
+    const { session } = client;
+    session.connections--;
+    session.touched = Date.now();
+    session.identity.expires = Date.now() + nicknameGraceMs;
+    broadcast(session.roomName, "presence", online(session.roomName));
+    publishRooms();
+    scheduleEmpty(session.room);
+  };
   const validateNickname = (value) => {
     const name =
       typeof value === "string" ? value.trim().replace(/\s+/g, " ") : "";
@@ -95,12 +106,18 @@ export function createChatServer(
     );
   const nicknameKey = (name) => name.normalize("NFKC").toLowerCase();
   const expireIdentity = (identity) => {
+    identity.revoked = true;
     if (identities.get(identity.key) === identity)
       identities.delete(identity.key);
     for (const [token, session] of sessions)
       if (session.identity === identity) sessions.delete(token);
   };
   const resolveIdentity = (name, existing) => {
+    if (existing?.identity.revoked)
+      throw Object.assign(
+        new Error("Session ended. Please choose a nickname again."),
+        { status: 401 },
+      );
     const key = nicknameKey(name);
     const occupied = identities.get(key);
     if (occupied && Date.now() > occupied.expires && !identityOnline(occupied))
@@ -353,9 +370,41 @@ export function createChatServer(
           );
           return json(response, 201, { upload: attachments.status(file) });
         }
+        if (url.pathname === "/api/logout") {
+          const session = authenticate(request, undefined, false);
+          if (!session)
+            return json(response, 401, {
+              error: "Already logged out or session expired.",
+            });
+          await body(request);
+          if (authenticate(request, undefined, false) !== session)
+            return json(response, 401, {
+              error: "Already logged out or session expired.",
+            });
+          const ownerSessions = new Set(
+            [...sessions.values()]
+              .filter((entry) => entry.identity === session.identity)
+              .map((entry) => entry.id),
+          );
+          expireIdentity(session.identity);
+          attachments.removeOwner(session.identity.id, ownerSessions);
+          // Detach synchronously: counts and nickname availability change before replying.
+          for (const client of [...clients]) {
+            if (client.session.identity !== session.identity) continue;
+            send(client.response, "logged-out", {});
+            disconnect(client);
+            client.response.end();
+          }
+          return json(response, 200, { loggedOut: true });
+        }
         if (url.pathname === "/api/nickname") {
+          const original = authenticate(request, undefined, false);
           throttle(nicknameAttempts, request.socket.remoteAddress, 30);
           const input = await body(request);
+          if (original?.identity.revoked)
+            return json(response, 401, {
+              error: "Session ended. Please join again.",
+            });
           const name = validateNickname(input?.name);
           const identity = resolveIdentity(
             name,
@@ -367,8 +416,13 @@ export function createChatServer(
           });
         }
         if (url.pathname === "/api/rooms") {
+          const original = authenticate(request, undefined, false);
           throttle(roomCreations, request.socket.remoteAddress, 5);
           const input = await body(request);
+          if (original?.identity.revoked)
+            return json(response, 401, {
+              error: "Session ended. Please join again.",
+            });
           const session = authenticate(request, undefined, false);
           const name = session?.name || validateNickname(input?.nickname);
           const room = await rooms.create(input?.name, input?.password);
@@ -383,6 +437,7 @@ export function createChatServer(
           return json(response, 201, result);
         }
         if (url.pathname === "/api/session") {
+          const original = authenticate(request, undefined, false);
           const address = request.socket.remoteAddress;
           const attempts = (joins.get(address) || []).filter(
             (time) => Date.now() - time < 60000,
@@ -394,6 +449,10 @@ export function createChatServer(
           attempts.push(Date.now());
           joins.set(address, attempts);
           const input = await body(request);
+          if (original?.identity.revoked)
+            return json(response, 401, {
+              error: "Session ended. Please join again.",
+            });
           const name = validateNickname(input?.name);
           const roomName = input?.room ?? "general";
           rooms.validateName(roomName);
@@ -636,15 +695,7 @@ export function createChatServer(
         });
         broadcast(session.roomName, "presence", online(session.roomName));
         publishRooms();
-        response.on("close", () => {
-          clients.delete(client);
-          session.connections--;
-          session.touched = Date.now();
-          session.identity.expires = Date.now() + nicknameGraceMs;
-          broadcast(session.roomName, "presence", online(session.roomName));
-          publishRooms();
-          scheduleEmpty(session.room);
-        });
+        response.on("close", () => disconnect(client));
         return;
       }
       if (request.method === "GET" && url.pathname === "/api/info") {

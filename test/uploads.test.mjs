@@ -147,3 +147,21 @@ test("a batch pins its room credential even if the visible room changes mid-uplo
   assert.deepEqual(await uploads.uploadAll(), ["first", "second"]);
   assert.deepEqual(credentials, ["original-room", "original-room"]);
 });
+
+test("logout abandons active and queued files even while publication controls are locked", () => {
+  const uploads = queue();
+  uploads.add(file("active"));
+  uploads.add(file("queued"));
+  const entries = [...uploads.entries];
+  let aborted = false;
+  entries[0].xhr = {
+    abort() {
+      aborted = true;
+    },
+  };
+  uploads.locked = true;
+  uploads.abandon();
+  assert.equal(aborted, true);
+  assert.equal(uploads.entries.length, 0);
+  assert.ok(entries.every((entry) => entry.cancelled));
+});

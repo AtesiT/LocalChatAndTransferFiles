@@ -44,6 +44,16 @@ export class AttachmentStore {
     }
   }
 
+  removeOwner(identityId, sessionIds) {
+    for (const file of [...this.files.values(), ...this.uploads.values()]) {
+      if (
+        !file.attached &&
+        (file.ownerIdentityId === identityId || sessionIds.has(file.ownerId))
+      )
+        this.remove(file.id);
+    }
+  }
+
   removeRoom(roomName) {
     for (const file of [...this.files.values(), ...this.uploads.values()])
       if (file.roomName === roomName) this.remove(file.id);
