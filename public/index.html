@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#101311" />
+    <title>localchat / #general</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' fill='%23101311'/%3E%3Ctext x='5' y='29' font-family='monospace' font-size='27' fill='%239dcc87'%3E%3E_%3C/text%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <main class="terminal">
+      <header class="statusbar">
+        <h1>localchat<span id="room-title" class="path"> / #general</span></h1>
+        <button
+          id="search-button"
+          type="button"
+          disabled
+          title="Search current room (Ctrl+F)"
+        >
+          [search]
+        </button>
+        <button id="rooms-button" type="button" disabled>[rooms]</button>
+        <button id="manage-button" type="button" hidden>[manage]</button>
+        <button id="settings-button" type="button">[settings]</button>
+        <button id="logout-button" type="button" hidden>[logout]</button>
+      </header>
+      <div id="search-bar" class="search-bar" hidden>
+        <label for="search-input">find:</label>
+        <input
+          id="search-input"
+          type="search"
+          maxlength="2000"
+          autocomplete="off"
+          placeholder="text, nickname or file name…"
+        />
+        <span id="search-count" role="status"></span>
+        <button id="search-close" type="button" aria-label="Close search">
+          [close]
+        </button>
+      </div>
+      <div id="drop-hint" class="drop-hint" hidden>[drop files to attach]</div>
+      <div class="workspace">
+        <section
+          id="messages"
+          class="messages"
+          role="log"
+          aria-label="Chat messages"
+          aria-live="polite"
+          aria-relevant="additions"
+        >
+          <div id="empty-state" class="empty-state">
+            <p><span class="system-prefix">--</span> localchat v0.4.0</p>
+            <p>
+              <span class="system-prefix">--</span> channel
+              <strong id="empty-room">#general</strong> / history in memory
+            </p>
+            <p>
+              <span class="system-prefix">--</span> No messages. Type below to
+              begin.
+            </p>
+          </div>
+        </section>
+        <aside class="roster" aria-label="Online users">
+          <h2>users <span id="people-count">0</span></h2>
+          <ul id="people-list"></ul>
+          <p id="no-people" class="muted">(no users)</p>
+        </aside>
+      </div>
+      <div class="input-area">
+        <button id="new-messages" class="new-messages" hidden>
+          [new messages ↓]
+        </button>
+        <span id="connection-text" class="sr-only" role="status"></span>
+        <div id="notice" class="notice" role="status" hidden></div>
+        <div id="reply-draft" class="reply-draft" hidden>
+          <span id="reply-preview"></span>
+          <button id="reply-cancel" type="button" aria-label="Cancel reply">
+            [cancel reply]
+          </button>
+        </div>
+        <div id="selected-file" class="selected-file" hidden>
+          <span id="file-status" role="status"></span>
+          <progress
+            id="upload-progress"
+            max="100"
+            value="0"
+            aria-label="Overall upload progress"
+          ></progress>
+          <ul id="file-list" aria-label="Attachments"></ul>
+        </div>
+        <form id="message-form" class="command-line">
+          <div class="prompt">
+            <button
+              id="identity"
+              type="button"
+              title="Change nickname"
+              aria-label="Change nickname"
+            >
+              <span id="my-name">guest</span></button
+            ><span id="prompt-room" class="prompt-path">@general</span
+            ><span class="prompt-symbol">:$</span>
+          </div>
+          <label class="sr-only" for="message-input">Message #general</label>
+          <textarea
+            id="message-input"
+            placeholder="type a message…"
+            rows="1"
+            maxlength="4000"
+            disabled
+            spellcheck="false"
+          ></textarea>
+          <input id="file-input" type="file" multiple hidden />
+          <button
+            id="attach-button"
+            class="send"
+            type="button"
+            disabled
+            aria-label="Attach files"
+          >
+            [attach]
+          </button>
+          <button
+            id="send-button"
+            class="send"
+            type="submit"
+            disabled
+            aria-label="Send message"
+          >
+            [send]
+          </button>
+        </form>
+        <footer class="help">
+          <span
+            >Enter send <span class="separator">/</span> Shift+Enter newline
+            <span class="rename-hint"
+              ><span class="separator">/</span> click nick to rename</span
+            ></span
+          ><span id="character-count"></span>
+        </footer>
+      </div>
+    </main>
+    <dialog id="join-dialog" aria-labelledby="join-title">
+      <section id="join-panel" autocomplete="off">
+        <h2 id="join-title">localchat / connect</h2>
+        <div id="nickname-step">
+          <label for="name-input">nickname:</label>
+          <div class="login-line">
+            <span aria-hidden="true">&gt;</span
+            ><input
+              id="name-input"
+              autocomplete="off"
+              placeholder="nickname"
+              maxlength="48"
+              spellcheck="false"
+              data-lpignore="true"
+              data-1p-ignore="true"
+              autofocus
+            />
+          </div>
+          <button id="nickname-next" type="button">[continue]</button>
+        </div>
+        <div id="room-step" hidden>
+          <p class="room-help">Choose a room. Numbers show people online.</p>
+          <ul
+            id="entry-room-list"
+            class="room-list"
+            aria-label="Available rooms"
+          ></ul>
+          <div id="join-password-field" hidden>
+            <label id="join-password-label" for="join-password"
+              >room password:</label
+            >
+            <div class="login-line">
+              <span aria-hidden="true">&gt;</span
+              ><input
+                id="join-password"
+                type="password"
+                autocomplete="off"
+                maxlength="256"
+                data-lpignore="true"
+                data-1p-ignore="true"
+              />
+            </div>
+          </div>
+          <div class="room-actions">
+            <button id="join-button" type="button" hidden>[join]</button
+            ><button id="open-create" type="button">[create room]</button
+            ><button id="entry-back" type="button">[change nick]</button
+            ><button id="entry-close" type="button" hidden>[close]</button>
+          </div>
+        </div>
+        <p id="join-error" class="error" role="alert"></p>
+      </section>
+    </dialog>
+    <dialog id="create-dialog" aria-labelledby="create-title">
+      <section autocomplete="off">
+        <h2 id="create-title">localchat / create room</h2>
+        <label for="create-name">room name:</label>
+        <div class="login-line">
+          <span aria-hidden="true">#</span
+          ><input
+            id="create-name"
+            autocomplete="off"
+            maxlength="32"
+            placeholder="room-name"
+            autocapitalize="none"
+            spellcheck="false"
+          />
+        </div>
+        <label for="create-password">room password (optional):</label>
+        <div class="login-line">
+          <span aria-hidden="true">&gt;</span
+          ><input
+            id="create-password"
+            type="password"
+            autocomplete="off"
+            maxlength="256"
+            data-lpignore="true"
+            data-1p-ignore="true"
+          />
+        </div>
+        <p class="room-help">
+          Blank = public. Names: a-z, 0-9, _ or -.<br />Empty rooms close after
+          15 seconds. #general stays open.
+        </p>
+        <p id="create-error" class="error" role="alert"></p>
+        <div class="room-actions">
+          <button id="create-button" type="button">[create]</button
+          ><button id="create-back" type="button">[back]</button>
+        </div>
+      </section>
+    </dialog>
+    <dialog id="rename-dialog" aria-labelledby="rename-title">
+      <form id="rename-form" autocomplete="off">
+        <h2 id="rename-title">localchat / nickname</h2>
+        <label for="rename-name">nickname:</label>
+        <div class="login-line">
+          <span aria-hidden="true">&gt;</span
+          ><input
+            id="rename-name"
+            autocomplete="off"
+            maxlength="48"
+            required
+            spellcheck="false"
+          />
+        </div>
+        <p id="rename-error" class="error" role="alert"></p>
+        <div class="room-actions">
+          <button type="submit">[save]</button
+          ><button id="rename-close" type="button">[close]</button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="manage-dialog" aria-labelledby="manage-title">
+      <section>
+        <h2 id="manage-title">localchat / manage room</h2>
+        <p class="room-help">
+          Creator controls. Changes apply to this room only.
+        </p>
+        <label for="manage-password">new password:</label>
+        <input
+          id="manage-password"
+          type="password"
+          maxlength="256"
+          autocomplete="off"
+          data-lpignore="true"
+          data-1p-ignore="true"
+        />
+        <p class="room-help">
+          Blank makes the room public. Other participants must rejoin after a
+          password change.
+        </p>
+        <button id="save-room-password" type="button">[change password]</button>
+        <h3>participants</h3>
+        <ul id="manage-members"></ul>
+        <p class="room-help">
+          Removal ends all of a participant's access grants in this room. This
+          is not a ban: they may rejoin if they know the current password.
+        </p>
+        <label for="delete-room-confirm"
+          >type the room name to delete it:</label
+        >
+        <input id="delete-room-confirm" autocomplete="off" spellcheck="false" />
+        <p class="room-help">
+          Deletes all room messages and files and disconnects everyone. This
+          cannot be undone.
+        </p>
+        <button id="delete-room-button" type="button">[delete room]</button>
+        <p id="manage-error" class="error" role="alert"></p>
+        <p id="manage-status" role="status"></p>
+        <div class="room-actions">
+          <button id="manage-close" type="button">[close]</button>
+        </div>
+      </section>
+    </dialog>
+    <dialog id="settings-dialog" aria-labelledby="settings-title">
+      <section>
+        <h2 id="settings-title">localchat / settings</h2>
+        <label for="notification-sound">notification sound:</label>
+        <select id="notification-sound"></select>
+        <label for="notification-volume"
+          >volume:
+          <output id="volume-value" for="notification-volume"
+            >35%</output
+          ></label
+        >
+        <input
+          id="notification-volume"
+          type="range"
+          min="0"
+          max="100"
+          step="1"
+          value="35"
+        />
+        <p class="room-help">
+          New messages from others in your room only.<br />Settings are saved on
+          this device.
+        </p>
+        <p id="audio-status" class="error" role="status"></p>
+        <div class="room-actions">
+          <button id="test-sound" type="button">[test sound]</button
+          ><button id="settings-close" type="button">[close]</button>
+        </div>
+      </section>
+    </dialog>
+  </body>
+</html>
